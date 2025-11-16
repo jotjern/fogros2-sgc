@@ -21,7 +21,10 @@ FROM chef AS builder
 
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
-RUN . /opt/ros/humble/setup.sh && cargo chef cook --recipe-path recipe.json
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/target \
+  . /opt/ros/humble/setup.sh && cargo chef cook --recipe-path recipe.json
 # to run with release mode, uncomment the following line
 # RUN . /opt/ros/humble/setup.sh cargo chef cook --release --recipe-path recipe.json
 
@@ -31,16 +34,26 @@ WORKDIR /app/scripts
 RUN bash ./generate_crypto.sh
 # build app
 WORKDIR /app
-RUN cd /app/signaling && cargo build --release
-RUN . /opt/ros/humble/setup.sh && cargo build 
+# Build everything (debug or release)
+RUN mkdir /app/bins
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/target \
+    . /opt/ros/humble/setup.sh && cargo build && cp /app/target/debug/gdp-router /app/bins/gdp-router
+
+# Build the signaling crate in release mode
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/target \
+    cd /app/signaling && cargo build --release && cp /app/target/release/sgc_signaling_server /app/bins/sgc_signaling_server
 
 # build the final image
 FROM chef
 WORKDIR /
-COPY --from=builder  /app/target/release/sgc_signaling_server /signaling_server
+COPY --from=builder  /app/bins/sgc_signaling_server /signaling_server
 COPY --from=builder /app/bench /fog_ws
 COPY --from=builder /app/src /src 
 COPY --from=builder /app/scripts /scripts
-COPY --from=builder /app/target/debug/gdp-router /
+COPY --from=builder /app/bins/gdp-router /
 
 CMD [ "source /opt/ros/rolling/setup.bash; cargo run", "router" ]

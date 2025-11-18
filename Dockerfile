@@ -47,6 +47,9 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/app/target \
     cd /app/signaling && cargo build --release && cp /app/target/release/sgc_signaling_server /app/bins/sgc_signaling_server
 
+FROM chef AS devcontainer
+WORKDIR /app
+
 # build the final image
 FROM chef
 WORKDIR /

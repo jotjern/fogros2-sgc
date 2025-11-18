@@ -1,0 +1,7 @@
+{
+  "rust-analyzer.check.overrideCommand": [
+    "bash",
+    "-lc",
+    ". /opt/ros/humble/setup.bash && cargo check --message-format=json"
+  ]
+}

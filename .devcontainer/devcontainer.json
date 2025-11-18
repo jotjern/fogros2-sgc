@@ -1,0 +1,36 @@
+{
+  "name": "fogros2-dev",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": "..",
+    "target": "devcontainer"
+  },
+  "mounts": [
+    "type=volume,source=cargo-registry,target=/usr/local/cargo/registry",
+    "type=volume,source=cargo-git,target=/usr/local/cargo/git",
+    "type=volume,source=cargo-target,target=/app/myproj/target"
+  ],
+  "runArgs": [
+    "--network=host",
+    "--privileged"
+  ],
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-vscode.cpptools",
+        "ms-iot.vscode-ros",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  "remoteUser": "root",
+  "workspaceFolder": "/app",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/app,type=bind",
+  "containerEnv": {
+    "CARGO_TARGET_DIR": "/app/target",
+    "RUST_BACKTRACE": "1",
+    "CARGO_TERM_COLOR": "always"
+  }
+}

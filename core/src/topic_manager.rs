@@ -9,7 +9,7 @@ use crate::structs::{
 
 use async_datachannel::DataStream;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::select;
 use tracing::subscriber;
 
@@ -19,7 +19,7 @@ use redis::{self, transaction, Client, Commands, PubSubCommands, RedisResult};
 use redis_async::{client, resp::FromResp};
 use tokio::process::Command;
 use tokio::sync::mpsc::{self};
-use tokio::time::Duration;
+use tokio::time::{Duration, Sleep};
 use tokio::time::{sleep, timeout};
 use utils::app_config::AppConfig;
 
@@ -117,8 +117,10 @@ async fn create_new_remote_publisher(
     let subscribers = get_entity_from_database(&redis_url, &subscriber_topic)
         .expect("Cannot get subscriber from database");
     info!("subscriber list {:?}", subscribers);
+    let mut known_subscribers: HashSet<String> =
+        subscribers.iter().cloned().collect();
 
-    let tasks = subscribers.clone().into_iter().map(|subscriber| {
+    let tasks = subscribers.into_iter().map(|subscriber| {
         let topic_name_clone = topic_name.clone();
         let topic_type_clone = topic_type.clone();
         let certificate_clone = certificate.clone();
@@ -158,62 +160,79 @@ async fn create_new_remote_publisher(
     });
     let mut tasks = tasks.collect::<Vec<_>>();
 
-    let message_handling_task_handle = tokio::spawn(async move {
-        loop {
-            let message = msgs.next().await;
-            match message {
-                Some(message) => {
-                    let received_operation = String::from_resp(message.unwrap()).unwrap();
-                    info!("KVS {}", received_operation);
-                    if (received_operation != "lpush") {
-                        info!("the operation is not lpush, ignore");
-                        continue;
-                    }
-                    let updated_subscribers =
-                        get_entity_from_database(&redis_url, &subscriber_topic)
-                            .expect("Cannot get subscriber from database");
-                    info!(
-                        "get a list of subscribers from KVS {:?}",
-                        updated_subscribers
-                    );
-                    let subscriber = updated_subscribers.first().unwrap(); //first or last?
-                    if subscribers.clone().contains(subscriber) {
-                        warn!("subscriber {} already in the list, ignore", subscriber);
-                        continue;
-                    }
-                    let publisher_url = format!(
-                        "{},{},{}",
-                        gdp_name_to_string(topic_gdp_name),
-                        gdp_name_to_string(publisher_listening_gdp_name),
-                        subscriber
-                    );
-                    info!("publisher listening for signaling url {}", publisher_url);
+    let message_handling_task_handle = tokio::spawn({
+        let mut known_subscribers = known_subscribers;
+        async move {
+            loop {
+                let message = msgs.next().await;
+                match message {
+                    Some(message) => {
+                        let received_operation = String::from_resp(message.unwrap()).unwrap();
+                        info!("KVS {}", received_operation);
+                        if received_operation != "lpush" {
+                            info!("the operation is not lpush, ignore");
+                            continue;
+                        }
+                        let updated_subscribers =
+                            get_entity_from_database(&redis_url, &subscriber_topic)
+                                .expect("Cannot get subscriber from database");
+                        info!(
+                            "get a list of subscribers from KVS {:?}",
+                            updated_subscribers
+                        );
 
-                    add_entity_to_database_as_transaction(
-                        &redis_url,
-                        &publisher_topic,
-                        &publisher_url,
-                    )
-                    .expect("Cannot add publisher to database");
-                    info!(
-                        "publisher {} added to database of channel {}",
-                        &publisher_url, publisher_topic
-                    );
+                        let mut new_subscribers = vec![];
+                        for subscriber in updated_subscribers {
+                            if known_subscribers.insert(subscriber.clone()) {
+                                new_subscribers.push(subscriber);
+                            } else {
+                                debug!(
+                                    "subscriber {} already processed, ignoring",
+                                    subscriber
+                                );
+                            }
+                        }
 
-                    let webrtc_stream = register_webrtc_stream(&publisher_url, None).await;
-                    info!("publisher registered webrtc stream");
-                    let _ros_handle = ros_topic_creator(
-                        webrtc_stream,
-                        format!("{}_{}", "ros_manager_node", rand::random::<u32>()),
-                        topic_name.clone(),
-                        topic_type.clone(),
-                        "sub".to_string(),
-                        certificate.clone(),
-                    )
-                    .await;
-                }
-                None => {
-                    info!("message is none");
+                        if new_subscribers.is_empty() {
+                            continue;
+                        }
+
+                        for subscriber in new_subscribers {
+                            let publisher_url = format!(
+                                "{},{},{}",
+                                gdp_name_to_string(topic_gdp_name),
+                                gdp_name_to_string(publisher_listening_gdp_name),
+                                subscriber
+                            );
+                            info!("publisher listening for signaling url {}", publisher_url);
+
+                            add_entity_to_database_as_transaction(
+                                &redis_url,
+                                &publisher_topic,
+                                &publisher_url,
+                            )
+                            .expect("Cannot add publisher to database");
+                            info!(
+                                "publisher {} added to database of channel {}",
+                                &publisher_url, publisher_topic
+                            );
+
+                            let webrtc_stream = register_webrtc_stream(&publisher_url, None).await;
+                            info!("publisher registered webrtc stream");
+                            let _ros_handle = ros_topic_creator(
+                                webrtc_stream,
+                                format!("{}_{}", "ros_manager_node", rand::random::<u32>()),
+                                topic_name.clone(),
+                                topic_type.clone(),
+                                "sub".to_string(),
+                                certificate.clone(),
+                            )
+                            .await;
+                        }
+                    }
+                    None => {
+                        info!("message is none");
+                    }
                 }
             }
         }
@@ -256,8 +275,10 @@ async fn create_new_remote_subscriber(
     let publishers = get_entity_from_database(&redis_url, &publisher_topic)
         .expect("Cannot get subscriber from database");
     info!("publisher list {:?}", publishers);
+    let mut known_publishers: HashSet<String> =
+        publishers.iter().cloned().collect();
 
-    let tasks = publishers.clone().into_iter().map(|publisher| {
+    let tasks = publishers.into_iter().map(|publisher| {
         let topic_name_clone = topic_name.clone();
         let topic_type_clone = topic_type.clone();
         let certificate_clone = certificate.clone();
@@ -334,48 +355,60 @@ async fn create_new_remote_subscriber(
                     Ok(message) => {
                         let received_operation = String::from_resp(message).unwrap();
                         info!("KVS {}", received_operation);
-                        if (received_operation != "lpush") {
+                        if received_operation != "lpush" {
                             info!("the operation is not lpush, ignore");
                             continue;
                         }
 
                         let updated_publishers = get_entity_from_database(&redis_url, &publisher_topic).expect("Cannot get publisher from database");
                         info!("get a list of publishers from KVS {:?}", updated_publishers);
-                        let publisher = updated_publishers.first().unwrap(); //first or last?
 
-                        if publishers.contains(publisher) {
-                            warn!("publisher {} already exists", publisher);
+                        let mut new_publishers = vec![];
+                        for publisher in updated_publishers {
+                            if known_publishers.insert(publisher.clone()) {
+                                new_publishers.push(publisher);
+                            } else {
+                                debug!("publisher {} already exists, ignoring", publisher);
+                            }
+                        }
+
+                        if new_publishers.is_empty() {
                             continue;
                         }
 
-                        if !publisher.ends_with(&gdp_name_to_string(subscriber_listening_gdp_name)) {
-                            warn!("find publisher mailbox {} doesn not end with subscriber {}", publisher, gdp_name_to_string(subscriber_listening_gdp_name));
-                            continue;
+                        for publisher in new_publishers {
+                            if !publisher.ends_with(&gdp_name_to_string(subscriber_listening_gdp_name.clone())) {
+                                debug!(
+                                    "publisher mailbox {} does not end with subscriber {}, skipping",
+                                    publisher,
+                                    gdp_name_to_string(subscriber_listening_gdp_name.clone())
+                                );
+                                continue;
+                            }
+                            let publisher = publisher.split(',').skip(4).take(4).collect::<Vec<&str>>().join(",");
+
+                            // subscriber's address
+                            let my_signaling_url = format!("{},{},{}", gdp_name_to_string(topic_gdp_name),gdp_name_to_string(subscriber_listening_gdp_name), publisher);
+                            // publisher's address
+                            let peer_dialing_url = format!("{},{},{}", gdp_name_to_string(topic_gdp_name),publisher, gdp_name_to_string(subscriber_listening_gdp_name));
+                            info!("subscriber uses signaling url {} that peers to {}", my_signaling_url, peer_dialing_url);
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                            info!("subscriber starts to register webrtc stream");
+                            // workaround to prevent subscriber from dialing before publisher is listening
+                            let webrtc_stream = register_webrtc_stream(&my_signaling_url, Some(peer_dialing_url)).await;
+
+                            info!("subscriber registered webrtc stream");
+
+                            let _ros_handle = ros_topic_creator(
+                                webrtc_stream,
+                                format!("{}_{}", "ros_manager_node", rand::random::<u32>()),
+                                topic_name.clone(),
+                                topic_type.clone(),
+                                "pub".to_string(),
+                                certificate.clone(),
+                            )
+                            .await;
                         }
-                        let publisher = publisher.split(',').skip(4).take(4).collect::<Vec<&str>>().join(",");
-
-                        // subscriber's address
-                        let my_signaling_url = format!("{},{},{}", gdp_name_to_string(topic_gdp_name),gdp_name_to_string(subscriber_listening_gdp_name), publisher);
-                        // publisher's address
-                        let peer_dialing_url = format!("{},{},{}", gdp_name_to_string(topic_gdp_name),publisher, gdp_name_to_string(subscriber_listening_gdp_name));
-                        // let subsc = format!("{}/{}", gdp_name_to_string(publisher_listening_gdp_name), subscriber);
-                        info!("subscriber uses signaling url {} that peers to {}", my_signaling_url, peer_dialing_url);
-                        tokio::time::sleep(Duration::from_millis(1000)).await;
-                        info!("subscriber starts to register webrtc stream");
-                        // workaround to prevent subscriber from dialing before publisher is listening
-                        let webrtc_stream = register_webrtc_stream(&my_signaling_url, Some(peer_dialing_url)).await;
-
-                        info!("subscriber registered webrtc stream");
-
-                        let _ros_handle = ros_topic_creator(
-                            webrtc_stream,
-                            format!("{}_{}", "ros_manager_node", rand::random::<u32>()),
-                            topic_name.clone(),
-                            topic_type.clone(),
-                            "pub".to_string(),
-                            certificate.clone(),
-                        )
-                        .await;
 
 
                     },

@@ -21,7 +21,8 @@ services:
       restart: always
       image: redislabs/redisinsight:latest
       ports:
-      - '8001:8001' # use 8002 for public interface of redis insight
+      - '8001:5540' # use 8002 for public interface of redis insight
+                    # port 5540 is the inside-docker port
 
     talker:
         restart: always
@@ -55,6 +56,8 @@ services:
         depends_on:
           - rib
           - signal
+        deploy:
+          replicas: 10
         environment:
           SGC_CONFIG: "automatic-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"

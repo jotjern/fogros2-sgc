@@ -3,6 +3,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// construct gdp struct from bytes
 /// bytes is put as payload
+// Wrap raw bytes (ROS message) into GDP packet for transmission
 pub fn construct_gdp_forward_from_bytes(
     destination: GDPName, source: GDPName, buffer: Vec<u8>,
 ) -> GDPPacket {

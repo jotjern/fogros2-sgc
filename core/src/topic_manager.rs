@@ -23,8 +23,10 @@ use tokio::time::{sleep, timeout};
 use tokio::time::{Duration, Sleep};
 use utils::app_config::AppConfig;
 
-/// determine the action of a new topic
-/// pub/sub/noop
+// Determine if this node should publish or subscribe to remote
+// "pub" = no local publishers, so receive from remote and publish locally
+// "sub" = no local subscribers, so subscribe locally and send to remote
+// "noop" = both exist locally, no bridging needed
 /// Currently it uses cli to get the information
 /// TODO: use r2r/rcl to get the information
 async fn determine_topic_action(topic_name: String) -> String {
@@ -58,6 +60,9 @@ async fn determine_topic_action(topic_name: String) -> String {
     }
 }
 
+// Bridge between WebRTC DataStream and local ROS topic
+// action="sub": WebRTC → ros_publisher → local ROS
+// action="pub": local ROS → ros_subscriber → WebRTC
 pub async fn ros_topic_creator(
     stream: async_datachannel::DataStream, node_name: String, topic_name: String,
     topic_type: String, action: String, certificate: Vec<u8>,
@@ -66,6 +71,8 @@ pub async fn ros_topic_creator(
         "topic creator for topic {}, type {}, action {}",
         topic_name, topic_type, action
     );
+    // ros_tx/rx: messages from WebRTC to ROS
+    // rtc_tx/rx: messages from ROS to WebRTC
     let (ros_tx, ros_rx) = mpsc::unbounded_channel();
     let (rtc_tx, rtc_rx) = mpsc::unbounded_channel();
     tokio::spawn(webrtc_reader_and_writer(stream, ros_tx.clone(), rtc_rx));
@@ -93,7 +100,11 @@ pub async fn ros_topic_creator(
     };
 }
 
-async fn create_new_remote_publisher(
+// This node receives from remote and publishes to local ROS
+// 1. Check Redis for existing subscribers in {topic}-sub
+// 2. For each subscriber, create WebRTC connection and listen
+// 3. Watch Redis for new subscribers and connect dynamically
+async fn create_network_to_ros_bridge(
     topic_gdp_name: GDPName, topic_name: String, topic_type: String, certificate: Vec<u8>,
 ) {
     let redis_url = get_redis_url();
@@ -104,6 +115,7 @@ async fn create_new_remote_publisher(
     let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp_name));
     let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp_name));
 
+    // Subscribe to Redis keyspace notifications to detect new subscribers
     let redis_addr_and_port = get_redis_address_and_port();
     let pubsub_con = client::pubsub_connect(redis_addr_and_port.0, redis_addr_and_port.1)
         .await
@@ -129,6 +141,7 @@ async fn create_new_remote_publisher(
 
         tokio::spawn(async move {
             info!("subscriber {}", subscriber);
+            // Signaling URL format: topic_guid,my_guid,subscriber_guid
             let publisher_url = format!(
                 "{},{},{}",
                 gdp_name_to_string(topic_gdp_name),
@@ -137,6 +150,7 @@ async fn create_new_remote_publisher(
             );
             info!("publisher listening for signaling url {}", publisher_url);
 
+            // Add to Redis {topic}-pub list so subscribers can find us
             add_entity_to_database_as_transaction(&redis_url, &publisher_topic, &publisher_url)
                 .expect("Cannot add publisher to database");
             info!(
@@ -144,6 +158,7 @@ async fn create_new_remote_publisher(
                 &publisher_url, publisher_topic
             );
 
+            // Listen for WebRTC connection (subscriber will dial)
             let webrtc_stream = register_webrtc_stream(&publisher_url, None).await;
             info!("publisher registered webrtc stream");
             let _ros_handle = ros_topic_creator(
@@ -251,7 +266,12 @@ async fn create_new_remote_publisher(
     info!("all the subscribers are checked!");
 }
 
-async fn create_new_remote_subscriber(
+// This node subscribes from local ROS and sends to remote
+// 1. Announce presence by adding GUID to Redis {topic}-sub
+// 2. Check Redis for existing publishers in {topic}-pub
+// 3. Connect to publishers with matching signaling URLs
+// 4. Watch Redis for new publishers and connect dynamically
+async fn create_ros_to_network_bridge(
     topic_gdp_name: GDPName, topic_name: String, topic_type: String, certificate: Vec<u8>,
 ) {
     let subscriber_listening_gdp_name = generate_random_gdp_name();
@@ -271,6 +291,7 @@ async fn create_new_remote_subscriber(
         .await
         .expect("Cannot subscribe to topic");
 
+    // Announce presence to publishers by adding GUID to {topic}-sub
     add_entity_to_database_as_transaction(
         &redis_url,
         &subscriber_topic,
@@ -289,6 +310,8 @@ async fn create_new_remote_subscriber(
         let topic_type_clone = topic_type.clone();
         let certificate_clone = certificate.clone();
         let subscriber_listening_gdp_name_clone = subscriber_listening_gdp_name.clone();
+        
+        // Only connect to publishers targeting this subscriber (URL ends with our GUID)
         if !publisher.ends_with(&gdp_name_to_string(subscriber_listening_gdp_name_clone)) {
             info!(
                 "find publisher mailbox {} doesn not end with subscriber {}",
@@ -335,6 +358,7 @@ async fn create_new_remote_subscriber(
             // workaround to prevent subscriber from dialing before publisher is listening
             tokio::time::sleep(Duration::from_millis(1000)).await;
             info!("subscriber starts to register webrtc stream");
+            // Initiate WebRTC connection to publisher
             let webrtc_stream =
                 register_webrtc_stream(&my_signaling_url, Some(peer_dialing_url)).await;
             info!("subscriber registered webrtc stream");
@@ -445,6 +469,10 @@ pub struct RosTopicStatus {
     pub action: String,
 }
 
+// Main entry point: manages distributed ROS topic bridging
+// 1. Reads config for topics to bridge
+// 2. Spawns publisher/subscriber handlers for each topic
+// 3. Optionally auto-discovers new topics every 5s
 pub async fn ros_topic_manager() {
     let mut waiting_rib_handles = vec![];
     // get ros information from config file
@@ -472,9 +500,10 @@ pub async fn ros_topic_manager() {
         // clear_topic_key(&gdp_name_to_string(topic_gdp_name));
 
         match action.as_str() {
+            // "sub" = no local ROS publisher, so receive from remote
             "sub" => {
                 let handle = tokio::spawn(async move {
-                    create_new_remote_publisher(
+                    create_network_to_ros_bridge(
                         topic_gdp_name,
                         topic_name.clone(),
                         topic_type,
@@ -486,9 +515,10 @@ pub async fn ros_topic_manager() {
 
                 waiting_rib_handles.push(handle);
             }
+            // "pub" = no local ROS subscriber, so send to remote
             "pub" => {
                 let handle = tokio::spawn(async move {
-                    create_new_remote_subscriber(
+                    create_ros_to_network_bridge(
                         topic_gdp_name,
                         topic_name.clone(),
                         topic_type,
@@ -520,8 +550,9 @@ pub async fn ros_topic_manager() {
     .expect("crypto file not found!");
     let ctx = r2r::Context::create().expect("failed to create context");
     let node = r2r::Node::create(ctx, "ros_manager", "namespace").expect("failed to create node");
-    // when a new topic is detected, create a new thread
-    // to handle the topic
+    
+    // Automatic topic discovery loop (polls every 5s)
+    // When a new topic is detected, create a new thread to handle the topic
     loop {
         select! {
             _ = sleep(Duration::from_millis(5000)) => {
@@ -558,7 +589,7 @@ pub async fn ros_topic_manager() {
                                 let certificate = certificate.clone();
                                 let handle = tokio::spawn(
                                     async move {
-                                        create_new_remote_publisher(topic_gdp_name, topic_name, topic_type, certificate).await;
+                                        create_network_to_ros_bridge(topic_gdp_name, topic_name, topic_type, certificate).await;
                                     }
                                 );
                                 waiting_rib_handles.push(handle);
@@ -573,7 +604,7 @@ pub async fn ros_topic_manager() {
                                 let topic_type = topic_type.clone();
                                 let handle = tokio::spawn(
                                     async move {
-                                        create_new_remote_subscriber(topic_gdp_name,
+                                        create_ros_to_network_bridge(topic_gdp_name,
                                             topic_name,
                                             topic_type,
                                             certificate).await;

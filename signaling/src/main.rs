@@ -29,6 +29,51 @@ type Id = String;
 type Tx = mpsc::UnboundedSender<Message>;
 type ClientsMap = Arc<Mutex<HashMap<Id, Tx>>>;
 
+// WebRTC Signaling Server for FogROS2-SGC
+//
+// Acts as a message relay between WebRTC peers that need to establish direct connections.
+// Listens on port 8000 for WebSocket connections at ws://server:8000/{client_id}
+//
+// Message Flow:
+// - Client A connects → registered in HashMap with its client_id
+// - Client A sends JSON: {"id": "client_b_id", "payload": {...}}
+// - Server rewrites sender: {"id": "client_a_id", "payload": {...}}
+// - Server forwards to Client B if connected
+// - Payloads contain WebRTC signaling (SDP offers/answers, ICE candidates)
+//
+// Client ID Format: Each WebRTC connection establishes TWO WebSocket connections
+// Publisher-side: "topic,publisher_guid,subscriber_guid"
+// Subscriber-side: "topic,subscriber_guid,publisher_guid" (flipped middle/last)
+//
+// Example WebRTC session:
+//   Publisher connects:  167,229,32,134,143,191,106,193,89,194,153,70
+//   Subscriber connects: 167,229,32,134,89,194,153,70,143,191,106,193 (same bytes, flipped)
+//
+// Redis RIB structure:
+//   {topic}-pub: stores full publisher-side client_id (topic,publisher,subscriber)
+//   {topic}-sub: stores just subscriber_guid (bytes 5-8 from subscriber-side format)
+//
+// Redis Integration (RIB - Routing Information Base):
+// - On disconnect: tries to remove from both {topic}-pub and {topic}-sub
+// - Depending on which side disconnects, one removal succeeds and one warns (expected)
+// - Publisher-side: successfully removes from -pub, warns on -sub
+// - Subscriber-side: successfully removes from -sub, warns on -pub
+
+/// Computes the paired client_id by swapping bytes 5-8 with bytes 9-12
+/// Example: "167,229,32,134,A,A,A,A,B,B,B,B" -> "167,229,32,134,B,B,B,B,A,A,A,A"
+fn get_paired_client_id(client_id: &str) -> String {
+    let parts: Vec<&str> = client_id.split(',').collect();
+    if parts.len() != 12 {
+        return String::new();
+    }
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{}",
+        parts[0], parts[1], parts[2], parts[3],
+        parts[8], parts[9], parts[10], parts[11],
+        parts[4], parts[5], parts[6], parts[7]
+    )
+}
+
 /// Removes the client (identified by `client_id`) from publisher and subscriber lists in the RIB
 fn remove_client_from_rib(client_id: &str) {
     // Connect to the Redis server
@@ -49,11 +94,15 @@ fn remove_client_from_rib(client_id: &str) {
     println!("Removing client {} from RIB", client_id);
 
     // Remove client_id from the publisher list in Redis
+    // WARNING: weird behavior
+    // Due to an unknown reason, we need to flip the subscriber_id and
+    // publisher_id to remove the client from the RIB
+    let paired_client_id = get_paired_client_id(client_id);
     let result: Result<isize, redis::RedisError> =
         redis::cmd("LREM")
             .arg(&publisher_topic)
             .arg(0)
-            .arg(client_id)
+            .arg(paired_client_id)
             .query(&mut con);
     match &result {
         Ok(0) => println!(
@@ -70,7 +119,9 @@ fn remove_client_from_rib(client_id: &str) {
         ),
     }
 
-    // Build subscriber name: skip the first 4, use the next 4 comma-separated elements
+    // Extract bytes 5-8 to remove from -sub list
+    // For publisher-side format (topic,pub,sub): extracts pub → removal fails (expected)
+    // For subscriber-side format (topic,sub,pub): extracts sub → removal succeeds
     let subscriber_name = client_id
         .split(',')
         .skip(4)

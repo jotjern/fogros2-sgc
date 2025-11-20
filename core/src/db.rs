@@ -20,6 +20,7 @@ use tokio::time::Duration;
 use tokio::time::{sleep, timeout};
 use utils::app_config::AppConfig;
 
+// Get Redis URL for RIB (Routing Information Base)
 pub fn get_redis_url() -> String {
     let config = AppConfig::fetch().expect("Failed to fetch config");
     format!("redis://{}", config.routing_information_base_address)
@@ -45,7 +46,7 @@ pub fn clear_topic_key(topic: &str) {
     redis::cmd("DEL").arg(subscriber_topic).execute(&mut con);
 }
 
-// add a publisher/subscriber to the database
+// Atomically add publisher/subscriber to Redis list (thread-safe)
 pub fn add_entity_to_database_as_transaction(
     redis_url: &str, key: &str, value: &str,
 ) -> RedisResult<()> {
@@ -58,7 +59,7 @@ pub fn add_entity_to_database_as_transaction(
     Ok(())
 }
 
-// get list of publishers/subscribers from the database
+// Get all publishers/subscribers from Redis list
 pub fn get_entity_from_database(redis_url: &str, key: &str) -> RedisResult<Vec<String>> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
@@ -66,6 +67,8 @@ pub fn get_entity_from_database(redis_url: &str, key: &str) -> RedisResult<Vec<S
     Ok(list)
 }
 
+// Enable Redis keyspace notifications for dynamic discovery
+// KEA = Keyspace events, Event types All
 pub fn allow_keyspace_notification(redis_url: &str) -> RedisResult<()> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;

@@ -7,6 +7,8 @@ pub const MAGIC_NUMBERS: u16 = u16::from_be_bytes([0x26, 0x2a]);
 
 pub type GdpName = [u8; 32];
 use serde::{Deserialize, Serialize};
+
+// Actions for GDP packets in the routing protocol
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, EnumIter)]
 pub enum GdpAction {
     Noop = 0,
@@ -59,8 +61,9 @@ impl From<u16be> for u16 {
     }
 }
 
+// 4-byte (256 bit) unique identifier for topics/nodes, derived from hash(topic_name, topic_type, certificate)
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, Default)]
-pub struct GDPName(pub [u8; 4]); // 256 bit destination
+pub struct GDPName(pub [u8; 4]);
 impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -85,6 +88,7 @@ pub(crate) trait Packet {
     fn get_header(&self) -> GDPHeaderInTransit;
 }
 
+// Main packet structure for sending ROS messages over WebRTC
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct GDPPacket {
     pub action: GdpAction,
@@ -200,6 +204,10 @@ pub enum GDPNameRecordType {
 
 use sha2::Digest;
 use sha2::Sha256;
+
+// Generate unique 4-byte identifier from topic metadata
+// Same (topic_name, topic_type, cert) → same GDPName across all nodes
+// This enables distributed topic matching without central coordination
 pub fn get_gdp_name_from_topic(topic_name: &str, topic_type: &str, cert: &[u8]) -> [u8; 4] {
     // create a Sha256 object
     let mut hasher = Sha256::new();
@@ -216,10 +224,7 @@ pub fn get_gdp_name_from_topic(topic_name: &str, topic_type: &str, cert: &[u8]) 
     // Get the first 4 bytes of the digest
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&result[..4]);
-
     bytes
-    // // Convert the bytes to a u32
-    // unsafe { transmute::<[u8; 4], u32>(bytes) }
 }
 
 #[derive(Debug, Clone)]
@@ -227,9 +232,11 @@ pub struct GDPStatus {
     pub sink: UnboundedSender<GDPPacket>,
 }
 
+// Convert GDPName to comma-separated string for Redis keys (e.g., "167,229,32,134")
 pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
     format!("{},{},{},{}", name[0], name[1], name[2], name[3])
 }
+
 pub fn string_to_gdp_name(name: &str) -> GDPName {
     let mut bytes = [0u8; 4];
     for (i, byte) in name.as_bytes().chunks(2).enumerate() {

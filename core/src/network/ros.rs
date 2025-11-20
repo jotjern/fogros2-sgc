@@ -12,6 +12,7 @@ use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 
+// Publishes messages to local ROS (receives from WebRTC)
 #[cfg(feature = "ros")]
 pub async fn ros_publisher(
     node_name: String, topic_name: String, topic_type: String, certificate: Vec<u8>,
@@ -61,6 +62,7 @@ pub async fn ros_publisher(
     }
 }
 
+// Subscribes to local ROS and sends to WebRTC
 #[cfg(feature = "ros")]
 pub async fn ros_subscriber(
     node_name: String, topic_name: String, topic_type: String, certificate: Vec<u8>,

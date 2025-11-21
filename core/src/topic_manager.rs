@@ -6,23 +6,19 @@ use crate::structs::{
 
 use async_datachannel::DataStream;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
-use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use utils::app_config::AppConfig;
 
 use crate::db::*;
-use futures::{StreamExt};
-use redis_async::{client, resp::FromResp};
+use futures::StreamExt;
+use redis_async::client;
 
-async fn watch_list_changes<F, Fut>(
+async fn watch_new_redis_list_items(
     list_key: String,
-    mut callback: F,
-) where
-    F: FnMut(String) -> Fut + Send + 'static + Clone,
-    Fut: std::future::Future<Output = ()> + Send + 'static,
-{
+) -> UnboundedReceiver<String> {
     let redis_url = get_redis_url();
     allow_keyspace_notification(&redis_url).unwrap();
 
@@ -37,25 +33,32 @@ async fn watch_list_changes<F, Fut>(
         .await
         .expect("Cannot subscribe");
 
-    let mut known = HashSet::<String>::new();
+    let (tx, rx) = unbounded_channel();
+    let mut known_items = HashSet::<String>::new();
 
-    loop {
-        let items = get_entity_from_database(&redis_url, &list_key)
-            .unwrap_or_default();
+    tokio::spawn(async move {
+        loop {
+            let items = get_entity_from_database(&redis_url, &list_key)
+                .unwrap_or_default();
 
-        for item in items {
-            if known.insert(item.clone()) {
-                tokio::spawn(callback(item));
+            for item in items {
+                if known_items.insert(item.clone()) {
+                    let _ = tx.send(item);
+                }
+            }
+
+            // Wait for a notification from the redis server
+            loop {
+                match stream.next().await {
+                    Some(Ok(_)) => break,
+                    Some(Err(e)) => error!("Error when waiting for redis updates: {}", e),
+                    None => ()
+                }
             }
         }
+    });
 
-        while let Some(Ok(msg)) = stream.next().await {
-            let op = String::from_resp(msg).unwrap();
-            if op == "lpush" {
-                break;
-            }
-        }
-    }
+    rx
 }
 
 async fn determine_topic_action(topic_name: String) -> String {
@@ -69,11 +72,11 @@ async fn determine_topic_action(topic_name: String) -> String {
     let output_str = String::from_utf8(out.stdout).unwrap();
 
     if output_str.contains("Publisher count: 0") {
-        return "pub".into();
+        "pub".into()
     } else if output_str.contains("Subscription count: 0") {
-        return "sub".into();
+        "sub".into()
     } else {
-        return "noop".into();
+        "noop".into()
     }
 }
 
@@ -85,8 +88,8 @@ pub async fn ros_topic_creator(
     action: String,
     certificate: Vec<u8>,
 ) {
-    let (ros_tx, ros_rx) = mpsc::unbounded_channel();
-    let (rtc_tx, rtc_rx) = mpsc::unbounded_channel();
+    let (ros_tx, ros_rx) = unbounded_channel();
+    let (rtc_tx, rtc_rx) = unbounded_channel();
 
     tokio::spawn(webrtc_reader_and_writer(stream, ros_tx.clone(), rtc_rx));
 
@@ -125,57 +128,34 @@ async fn create_new_remote_publisher(
     let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp));
     let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp));
 
-    watch_list_changes(
-        subscriber_topic.clone(),
-        {
-            let topic_name = topic_name.clone();
-            let topic_type = topic_type.clone();
-            let certificate = certificate.clone();
-            let redis_url = redis_url.clone();
-            let publisher_topic = publisher_topic.clone();
-            let topic_gdp = topic_gdp.clone();
+    let mut changes = watch_new_redis_list_items(subscriber_topic.clone()).await;
 
-            move |subscriber_entry: String| {
-                let topic_name = topic_name.clone();
-                let topic_type = topic_type.clone();
-                let certificate = certificate.clone();
-                let redis_url = redis_url.clone();
-                let publisher_topic = publisher_topic.clone();
-                let topic_gdp = topic_gdp.clone();
-                let publisher_side_gdp = publisher_side_gdp.clone();
+    while let Some(new_subscriber) = changes.recv().await {
+        let publisher_url = format!(
+            "{},{},{}",
+            gdp_name_to_string(topic_gdp),
+            gdp_name_to_string(publisher_side_gdp),
+            new_subscriber
+        );
 
-                async move {
-                    let publisher_url = format!(
-                        "{},{},{}",
-                        gdp_name_to_string(topic_gdp),
-                        gdp_name_to_string(publisher_side_gdp),
-                        subscriber_entry
-                    );
+        add_entity_to_database_as_transaction(
+            &redis_url,
+            &publisher_topic,
+            &publisher_url,
+        )
+        .expect("Cannot add publisher entry");
 
-                    add_entity_to_database_as_transaction(
-                        &redis_url,
-                        &publisher_topic,
-                        &publisher_url,
-                    )
-                    .expect("Cannot add publisher entry");
+        let stream = register_webrtc_stream(&publisher_url, None).await;
 
-                    let stream =
-                        register_webrtc_stream(&publisher_url, None).await;
-
-                    ros_topic_creator(
-                        stream,
-                        format!("ros_manager_node_{}", rand::random::<u32>()),
-                        topic_name,
-                        topic_type,
-                        "sub".into(),
-                        certificate,
-                    )
-                    .await;
-                }
-            }
-        },
-    )
-    .await;
+        tokio::spawn(ros_topic_creator(
+            stream,
+            format!("ros_manager_node_{}", rand::random::<u32>()),
+            topic_name.clone(),
+            topic_type.clone(),
+            "sub".into(),
+            certificate.clone(),
+        ));
+    }
 }
 
 async fn create_new_remote_subscriber(
@@ -197,69 +177,47 @@ async fn create_new_remote_subscriber(
     )
     .expect("add subscriber");
 
-    watch_list_changes(
-        publisher_topic.clone(),
-        {
-            let topic_name = topic_name.clone();
-            let topic_type = topic_type.clone();
-            let certificate = certificate.clone();
-            let topic_gdp = topic_gdp.clone();
-            let subscriber_side_gdp = subscriber_side_gdp.clone();
+    let mut changes = watch_new_redis_list_items(publisher_topic.clone()).await;
 
-            move |publisher: String| {
-                let topic_name = topic_name.clone();
-                let topic_type = topic_type.clone();
-                let certificate = certificate.clone();
-                let topic_gdp = topic_gdp.clone();
-                let subscriber_side_gdp = subscriber_side_gdp.clone();
+    while let Some(publisher) = changes.recv().await {
+        if !publisher.ends_with(&gdp_name_to_string(subscriber_side_gdp.clone())) {
+            continue;
+        }
 
-                async move {
-                    // Check recipient
-                    if !publisher.ends_with(&gdp_name_to_string(subscriber_side_gdp.clone())) {
-                        return;
-                    }
+        let remote = publisher
+            .split(',')
+            .skip(4)
+            .take(4)
+            .collect::<Vec<&str>>()
+            .join(",");
 
-                    // Strip prefix
-                    let remote = publisher
-                        .split(',')
-                        .skip(4)
-                        .take(4)
-                        .collect::<Vec<&str>>()
-                        .join(",");
+        let my_url = format!(
+            "{},{},{}",
+            gdp_name_to_string(topic_gdp),
+            gdp_name_to_string(subscriber_side_gdp),
+            remote
+        );
 
-                    let my_url = format!(
-                        "{},{},{}",
-                        gdp_name_to_string(topic_gdp),
-                        gdp_name_to_string(subscriber_side_gdp),
-                        remote
-                    );
+        let peer_url = format!(
+            "{},{},{}",
+            gdp_name_to_string(topic_gdp),
+            remote,
+            gdp_name_to_string(subscriber_side_gdp)
+        );
 
-                    let peer_url = format!(
-                        "{},{},{}",
-                        gdp_name_to_string(topic_gdp),
-                        remote,
-                        gdp_name_to_string(subscriber_side_gdp)
-                    );
+        sleep(Duration::from_millis(1000)).await;
 
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
+        let stream = register_webrtc_stream(&my_url, Some(peer_url)).await;
 
-                    let stream =
-                        register_webrtc_stream(&my_url, Some(peer_url)).await;
-
-                    ros_topic_creator(
-                        stream,
-                        format!("ros_manager_node_{}", rand::random::<u32>()),
-                        topic_name,
-                        topic_type,
-                        "pub".into(),
-                        certificate,
-                    )
-                    .await;
-                }
-            }
-        },
-    )
-    .await;
+        tokio::spawn(ros_topic_creator(
+            stream,
+            format!("ros_manager_node_{}", rand::random::<u32>()),
+            topic_name.clone(),
+            topic_type.clone(),
+            "pub".into(),
+            certificate.clone(),
+        ));
+    }
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
@@ -271,7 +229,8 @@ pub async fn ros_topic_manager() {
     let config = AppConfig::fetch().unwrap();
     let certificate = std::fs::read(format!(
         "./scripts/crypto/{}/{}-private.pem",
-        config.crypto_name, config.crypto_name
+        config.crypto_name,
+        config.crypto_name
     ))
     .expect("crypto file missing");
 
@@ -294,6 +253,8 @@ pub async fn ros_topic_manager() {
             let ttype = types[0].clone();
             let action = determine_topic_action(tname.clone()).await;
 
+            println!("COMPARE: ttype={}, action={}", ttype, action);
+
             let gdp = GDPName(get_gdp_name_from_topic(
                 &tname,
                 &ttype,
@@ -302,9 +263,7 @@ pub async fn ros_topic_manager() {
 
             topic_status.insert(
                 tname.clone(),
-                RosTopicStatus {
-                    action: action.clone(),
-                },
+                RosTopicStatus { action: action.clone() },
             );
 
             match action.as_str() {

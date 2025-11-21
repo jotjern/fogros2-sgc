@@ -253,8 +253,6 @@ pub async fn ros_topic_manager() {
             let ttype = types[0].clone();
             let action = determine_topic_action(tname.clone()).await;
 
-            println!("COMPARE: ttype={}, action={}", ttype, action);
-
             let gdp = GDPName(get_gdp_name_from_topic(
                 &tname,
                 &ttype,

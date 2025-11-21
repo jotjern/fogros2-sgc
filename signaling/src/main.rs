@@ -49,12 +49,11 @@ fn remove_client_from_rib(client_id: &str) {
     println!("Removing client {} from RIB", client_id);
 
     // Remove client_id from the publisher list in Redis
-    let result: Result<isize, redis::RedisError> =
-        redis::cmd("LREM")
-            .arg(&publisher_topic)
-            .arg(0)
-            .arg(client_id)
-            .query(&mut con);
+    let result: Result<isize, redis::RedisError> = redis::cmd("LREM")
+        .arg(&publisher_topic)
+        .arg(0)
+        .arg(client_id)
+        .query(&mut con);
     match &result {
         Ok(0) => println!(
             "Warning: client '{}' was not found in publisher list '{}'",
@@ -79,12 +78,11 @@ fn remove_client_from_rib(client_id: &str) {
         .join(",");
 
     // Remove subscriber_name from the subscriber list in Redis
-    let result: Result<isize, redis::RedisError> =
-        redis::cmd("LREM")
-            .arg(&subscriber_topic)
-            .arg(0)
-            .arg(&subscriber_name)
-            .query(&mut con);
+    let result: Result<isize, redis::RedisError> = redis::cmd("LREM")
+        .arg(&subscriber_topic)
+        .arg(0)
+        .arg(&subscriber_name)
+        .query(&mut con);
     match &result {
         Ok(0) => println!(
             "Warning: subscriber '{}' was not found in subscriber list '{}'",

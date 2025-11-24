@@ -6,7 +6,6 @@ use crate::structs::{generate_random_gdp_name, GDPName};
 use crate::structs::{GDPPacket, GdpAction, Packet};
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-const UDP_BUFFER_SIZE: usize = 1748000; // 17kb
 
 use async_datachannel::{DataStream, Message, PeerConnection, RtcConfig};
 use async_tungstenite::{tokio::connect_async, tungstenite};
@@ -17,12 +16,25 @@ use futures::{
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 use utils::app_config::AppConfig;
 
-/// parse the header of the packet using the first null byte as delimiter
-/// return a vector of (header, payload) pairs if the header is complete
-/// return the remaining (header, payload) pairs if the header is incomplete
+// Buffer size for receiving WebRTC data chunks (1.7MB)
+const UDP_BUFFER_SIZE: usize = 1748000;
+const MAX_RESET_ATTEMPTS: usize = 5;
+
+/// Parses GDP packets from a byte buffer using null-byte delimited JSON headers.
+///
+/// Packet format: `[JSON Header]\0[Binary Payload]`
+///
+/// # Returns
+/// - A vector of complete (header, payload) pairs
+/// - An optional incomplete (header, payload) if more data is needed
+///
+/// # Behavior
+/// - Handles multiple complete packets in one buffer
+/// - Returns partial packet state when data is incomplete
+/// - Uses Noop header to signal unparseable data
 pub fn parse_header_payload_pairs(
     mut buffer: Vec<u8>,
 ) -> (
@@ -30,26 +42,27 @@ pub fn parse_header_payload_pairs(
     Option<(GDPHeaderInTransit, Vec<u8>)>,
 ) {
     let mut header_payload_pairs: Vec<(GDPHeaderInTransit, Vec<u8>)> = Vec::new();
-    // TODO: get it to default trace later
+    
     let default_gdp_header: GDPHeaderInTransit = GDPHeaderInTransit {
         action: GdpAction::Noop,
         destination: GDPName([0u8, 0, 0, 0]),
         length: 0, // doesn't have any payload
     };
-    if buffer.len() == 0 {
+    
+    if buffer.is_empty() {
         return (header_payload_pairs, None);
     }
+    
     loop {
-        // parse the header
-        // use the first null byte \0 as delimiter
-        // split to the first \0 as delimiter
+        // Split buffer at first null byte: [header]\0[payload + rest]
         let header_and_remaining = buffer.splitn(2, |c| c == &0).collect::<Vec<_>>();
         let header_buf = header_and_remaining[0];
         let header: &str = std::str::from_utf8(header_buf).unwrap();
         info!("received header json string: {:?}", header);
+        
+        // Try parsing JSON header
         let gdp_header_parsed = serde_json::from_str::<GDPHeaderInTransit>(header);
         if gdp_header_parsed.is_err() {
-            // if the header is not complete, return the remaining
             warn!("header is not complete, return the remaining");
             return (
                 header_payload_pairs,
@@ -59,41 +72,66 @@ pub fn parse_header_payload_pairs(
         let gdp_header = gdp_header_parsed.unwrap();
         let remaining = header_and_remaining[1];
 
+        // Check if we have enough data for the payload
         if gdp_header.length > remaining.len() {
-            // if the payload is not complete, return the remaining
+            // Incomplete payload - need more data
             return (header_payload_pairs, Some((gdp_header, remaining.to_vec())));
         } else if gdp_header.length == remaining.len() {
-            // if the payload is complete, return the pair
+            // If the payload is complete, return the pair
+            // Exact match - this is the last packet
             header_payload_pairs.push((gdp_header, remaining.to_vec()));
             return (header_payload_pairs, None);
         } else {
-            // if the payload is longer than the remaining, continue to parse
+            // If the payload is not complete, return the remaining
+            // Buffer contains additional packets - extract payload and continue
             header_payload_pairs.push((gdp_header, remaining[..gdp_header.length].to_vec()));
             buffer = remaining[gdp_header.length..].to_vec();
         }
     }
 }
 
-/// Works with the signalling server from https://github.com/paullouisageneau/libdatachannel/tree/master/examples/signaling-server-rust
-/// Start two shells
-/// 1. RUST_LOG=debug cargo run --example smoke -- ws://127.0.0.1:8000 other_peer
-/// 2. RUST_LOG=debug cargo run --example smoke -- ws://127.0.0.1:8000 initiator other_peer
+// ============================================================================
+// WebRTC Connection Establishment
+// ============================================================================
+
+// Works with the signalling server from https://github.com/paullouisageneau/libdatachannel/tree/master/examples/signaling-server-rust
+// Start two shells
+// 1. RUST_LOG=debug cargo run --example smoke -- ws://127.0.0.1:8000 other_peer
+// 2. RUST_LOG=debug cargo run --example smoke -- ws://127.0.0.1:8000 initiator other_peer
 
 #[derive(Debug, Serialize, Deserialize)]
 struct SignalingMessage {
-    // id of the peer this messaged is supposed for
-    id: String,
-    payload: Message,
+    id: String,      // Target peer ID (the id of the peer this message is supposed for)
+    payload: Message, // WebRTC signaling data (SDP offer/answer, ICE candidates)
 }
 
+/// Establishes a WebRTC data channel connection via signaling server.
+///
+/// # Process
+/// 1. Connects to signaling server via WebSocket
+/// 2. Exchanges ICE candidates and SDP offers/answers through signaling server
+/// 3. Establishes direct peer-to-peer WebRTC data channel
+///
+/// # Arguments
+/// - `my_id`: This peer's identifier
+/// - `peer_to_dial`: If Some, initiates connection; if None, waits for incoming connection
+///
+/// # Returns
+/// An established WebRTC DataStream for bidirectional communication
 pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -> DataStream {
     let config = AppConfig::fetch().expect("Failed to fetch config");
+    
+    // Configure WebRTC with Google's public STUN server for NAT traversal
     let ice_servers = vec!["stun:stun.l.google.com:19302"];
     let conf = RtcConfig::new(&ice_servers);
+    
+    // Set up channels for signaling messages (SDP/ICE exchange)
+    // These channels allow the PeerConnection instance to communicate signaling data to and from the WebSocket signaling server.
     let (tx_sig_outbound, mut rx_sig_outbound) = mpsc::channel(32);
     let (mut tx_sig_inbound, rx_sig_inbound) = mpsc::channel(32);
     let listener = PeerConnection::new(&conf, (tx_sig_outbound, rx_sig_inbound)).unwrap();
 
+    // Connect to signaling server via WebSocket
     let signaling_uri = config.signaling_server_address;
     let signaling_uri = format!("{}/{}", signaling_uri, my_id);
     info!("The signaling URI is {}", signaling_uri);
@@ -101,6 +139,13 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     let (mut write, mut read) = connect_async(&signaling_uri).await.unwrap().0.split();
     let other_peer = Arc::new(Mutex::new(peer_to_dial.clone()));
     let other_peer_c = other_peer.clone();
+    
+    // Task: This asynchronous task listens for outgoing WebRTC signaling messages
+    // produced by the PeerConnection (such as ICE candidates and SDP offers/answers).
+    // For each signaling message, it wraps the message in a SignalingMessage struct,
+    // specifying the intended peer's ID, serializes it to JSON, and sends it over the
+    // WebSocket connection to the signaling server, which relays it to the remote peer.
+    // If sending fails, an error is logged and the loop breaks.
     let f_write = async move {
         while let Some(m) = rx_sig_outbound.next().await {
             let m = SignalingMessage {
@@ -120,6 +165,9 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
         anyhow::Result::<_, anyhow::Error>::Ok(())
     };
     tokio::spawn(f_write);
+    
+    // Task: Receive inbound signaling messages from peer via signaling server
+    // Similar to the f_write task above
     let f_read = async move {
         while let Some(Ok(m)) = read.next().await {
             info!("received {:?}", m);
@@ -142,32 +190,20 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
                 }
             }
         }
-        // _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-        //     // info!("timeout!!!!")
-        //     match other_peer.lock().as_ref() {
-        //         Some(_) => {
-        //             info!("timeout, returning");
-        //         }
-        //         None => {
-        //             warn!("timeout when waiting for peer to connect");
-        //             return anyhow::Result::<_, anyhow::Error>::Ok(());
-        //         }
-        //     }
-        // }
-
         anyhow::Result::<_, anyhow::Error>::Ok(())
     };
 
     tokio::spawn(f_read);
+    
+    // Establish the data channel connection
     let stream = if peer_to_dial.is_some() {
-        // here we are the initiator
+        // We are the initiator: dial the peer
         info!("dialing");
         let dc = listener.dial("whatever").await.unwrap();
         info!("dial succeed");
-
-        // dc.write_all(b"Ping").await.unwrap();
         dc
     } else {
+        // We are the responder: accept incoming connection
         info!("accepting");
         let dc = listener.accept().await.unwrap();
         info!("accept succeed");
@@ -176,16 +212,30 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     stream
 }
 
+// ============================================================================
+// Bidirectional GDP Packet Transfer over WebRTC
+// ============================================================================
+
+/// Manages bidirectional GDP packet transfer between WebRTC stream and ROS.
+///
+/// # Architecture
+/// ```text
+///     ROS → rtc_rx → [serialize] → WebRTC Stream
+///     WebRTC Stream → [parse/reassemble] → ros_tx → ROS
+/// ```
+///
+/// # Packet Reassembly
+/// Handles fragmented packets across multiple reads using stateful buffering.
+/// If a packet arrives incomplete, it's buffered until more data arrives.
 #[allow(unused_assignments)]
 pub async fn webrtc_reader_and_writer(
     mut stream: DataStream,
-    ros_tx: UnboundedSender<GDPPacket>,       // send to ros
-    mut rtc_rx: UnboundedReceiver<GDPPacket>, // receive from ros
+    ros_tx: UnboundedSender<GDPPacket>,       // Send parsed packets to ROS
+    mut rtc_rx: UnboundedReceiver<GDPPacket>, // Receive packets from ROS to forward
 ) {
-    // tracing_subscriber::fmt::init();
-    // let mut stream = register_webrtc_stream(my_id, peer_to_dial).await;
-
     let thread_name: GDPName = generate_random_gdp_name();
+    
+    // State for reassembling fragmented packets
     let mut need_more_data_for_previous_header = false;
     let mut remaining_gdp_header: GDPHeaderInTransit = GDPHeaderInTransit {
         action: GdpAction::Noop,
@@ -202,53 +252,63 @@ pub async fn webrtc_reader_and_writer(
         tokio::select! {
             // _ = do_stuff_async()
             // async read is cancellation safe
+            // ========================================
+            // RECEIVE: WebRTC → ROS
+            // ========================================
             Ok(receiving_buf_size) = stream.read(&mut receiving_buf) => {
-                // let receiving_buf_size = receiving_buf.len();
                 let mut receiving_buf = receiving_buf[..receiving_buf_size].to_vec();
                 info!("read {} bytes", receiving_buf_size);
 
                 let mut header_payload_pair = vec!();
 
-                // last time it has incomplete buffer to complete
+                // Reassemble with previous incomplete packet if needed
                 if need_more_data_for_previous_header {
-                    let read_payload_size = remaining_gdp_payload.len() + receiving_buf_size;
+                    let total_payload_size = remaining_gdp_payload.len() + receiving_buf_size;
+                    
                     if remaining_gdp_header.action == GdpAction::Noop {
-                        warn!("last time it has incomplete buffer to complete, the action is Noop.");
-                        // receiving_buf.append(&mut remaining_gdp_payload.clone());
+                        // Header was incomplete/unparseable - try reparsing with more data
+                        warn!("last time it had incomplete buffer to complete, the action is Noop.");
+                        warn!("Incomplete header from previous read, retrying parse");
                         remaining_gdp_payload.append(&mut receiving_buf[..receiving_buf_size].to_vec());
                         receiving_buf = remaining_gdp_payload.clone();
                         reset_counter += 1;
-                        if reset_counter >5 {
-                            error!("unable to match the buffer, reset the connection");
+                        
+                        if reset_counter > MAX_RESET_ATTEMPTS {
+                            error!("Failed to parse header after {} attempts, resetting state", MAX_RESET_ATTEMPTS);
                             receiving_buf = vec!();
                             remaining_gdp_payload = vec!();
                             reset_counter = 0;
                         }
                     }
-                    else if read_payload_size < remaining_gdp_header.length { //still need more things to read!
-                        info!("more data to read. Current {}, need {}, expect {}", read_payload_size, remaining_gdp_header.length, remaining_gdp_header.length - read_payload_size);
+                    else if total_payload_size < remaining_gdp_header.length { //still need more things to read!
+                        // Still incomplete - buffer and wait for more data
+                        info!("Need more payload data: have {}, need {}, expect {}", total_payload_size, remaining_gdp_header.length, remaining_gdp_header.length - total_payload_size);
                         remaining_gdp_payload.append(&mut receiving_buf[..receiving_buf_size].to_vec());
                         continue;
                     }
-                    else if read_payload_size == remaining_gdp_header.length { // match the end of the packet
+                    else if total_payload_size == remaining_gdp_header.length {
+                        // Exact match - packet is now complete
                         remaining_gdp_payload.append(&mut receiving_buf[..receiving_buf_size].to_vec());
                         header_payload_pair.push((remaining_gdp_header, remaining_gdp_payload.clone()));
                         receiving_buf = vec!();
                     }
-                    else{ //overflow!!
-                        // only get what's needed
-                        warn!("The packet is overflowed!!! read_payload_size {}, remaining_gdp_header.length {}, remaining_gdp_payload.len() {}, receiving_buf_size {}", read_payload_size, remaining_gdp_header.length, remaining_gdp_payload.len(), receiving_buf_size);
-                        let num_remaining = remaining_gdp_header.length - remaining_gdp_payload.len();
-                        remaining_gdp_payload.append(&mut receiving_buf[..num_remaining].to_vec());
-                        header_payload_pair.push((remaining_gdp_header, remaining_gdp_payload.clone()));
-                        // info!("remaining_gdp_payload {:.unwrap()}", remaining_gdp_payload);
+                    else { // overflow!!
+                        // Overflow - buffer contains multiple packets
+                        warn!("The packet is overflowed!!! read_payload_size {}, remaining_gdp_header.length {}, remaining_gdp_payload.len() {}, receiving_buf_size {}", total_payload_size, remaining_gdp_header.length, remaining_gdp_payload.len(), receiving_buf_size);
 
-                        receiving_buf = receiving_buf[num_remaining..].to_vec();
+                        warn!("Buffer overflow: have {}, need {} bytes", total_payload_size, remaining_gdp_header.length);
+                        let bytes_needed = remaining_gdp_header.length - remaining_gdp_payload.len();
+                        remaining_gdp_payload.append(&mut receiving_buf[..bytes_needed].to_vec());
+                        header_payload_pair.push((remaining_gdp_header, remaining_gdp_payload.clone()));
+                        receiving_buf = receiving_buf[bytes_needed..].to_vec();
                     }
                 }
 
+                // Parse any complete packets from the buffer
                 let (mut processed_gdp_packets, processed_remaining_header) = parse_header_payload_pairs(receiving_buf.to_vec());
                 header_payload_pair.append(&mut processed_gdp_packets);
+                
+                // Forward all complete packets to ROS
                 for (header, payload) in header_payload_pair {
                     let deserialized = header; //TODO: change the var name here
 
@@ -271,6 +331,7 @@ pub async fn webrtc_reader_and_writer(
                     }
                 }
 
+                // Update state for next read
                 match processed_remaining_header {
                     Some((header, payload)) => {
                         remaining_gdp_header = header;
@@ -284,8 +345,10 @@ pub async fn webrtc_reader_and_writer(
                 }
             },
 
+            // ========================================
+            // SEND: ROS → WebRTC
+            // ========================================
             Some(pkt_to_forward) = rtc_rx.recv() => {
-                //info!("TCP packet to forward: {:.unwrap()}", pkt_to_forward);
                 let transit_header = pkt_to_forward.get_header();
                 let mut header_string = serde_json::to_string(&transit_header).unwrap();
                 info!("the header size is {}", header_string.len());
@@ -297,30 +360,25 @@ pub async fn webrtc_reader_and_writer(
                 match stream.write_all(&header_string_payload[..header_string_payload.len()]).await {
                     Ok(_) => {},
                     Err(e) => {
-                        warn!("The connection is closed: {}", e);
+                        warn!("Connection closed during write: {}", e);
                         break;
                     }
                 }
 
-                // stream.write_all(&packet.payload[..packet.payload.len()]).await.unwrap();
+                // Write payload if present
                 if let Some(payload) = pkt_to_forward.payload {
-                    info!("the payload length is {}", payload.len());
-                    stream.write_all(&payload[..payload.len()]).await.unwrap();
+                    info!("Writing payload: {} bytes", payload.len());
+                    stream.write_all(&payload).await.unwrap();
                 }
 
+                // Write name record if present
                 if let Some(name_record) = pkt_to_forward.name_record {
                     let name_record_string = serde_json::to_string(&name_record).unwrap();
-                    let name_record_buffer = name_record_string.as_bytes();
-                    info!("the name record length is {}", name_record_buffer.len());
-                    stream.write_all(&name_record_buffer[..name_record_buffer.len()]).await.unwrap();
+                    let name_record_bytes = name_record_string.as_bytes();
+                    info!("Writing name record: {} bytes", name_record_bytes.len());
+                    stream.write_all(name_record_bytes).await.unwrap();
                 }
             }
         }
     }
-    // loop {
-    //     let n = dc.read(&mut buf).await.unwrap();
-    //     println!("Read: \"{}\"", String::from_utf8_lossy(&buf[..n]));
-    //     dc.write_all(b"Ping").await.unwrap();
-    //     tokio::time::sleep(Duration::from_secs(2)).await;
-    // }
 }

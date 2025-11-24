@@ -40,7 +40,7 @@ pub async fn ros_publisher(
 
     let _handle = tokio::task::spawn_blocking(move || loop {
         node.spin_once(std::time::Duration::from_millis(10));
-        // std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
     loop {
@@ -89,7 +89,8 @@ pub async fn ros_subscriber(
         .expect("topic subscribing failure");
 
     let _handle = tokio::task::spawn_blocking(move || loop {
-        node.spin_once(std::time::Duration::from_millis(100));
+        node.spin_once(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
     loop {

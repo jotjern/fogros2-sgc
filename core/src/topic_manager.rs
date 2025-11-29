@@ -6,9 +6,9 @@ use crate::structs::{
 
 use async_datachannel::DataStream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::time::{sleep, Duration};
 use utils::app_config::AppConfig;
 
@@ -16,9 +16,7 @@ use crate::db::*;
 use futures::StreamExt;
 use redis_async::client;
 
-async fn watch_new_redis_list_items(
-    list_key: String,
-) -> UnboundedReceiver<String> {
+async fn watch_new_redis_list_items(list_key: String) -> UnboundedReceiver<String> {
     let redis_url = get_redis_url();
     allow_keyspace_notification(&redis_url).unwrap();
 
@@ -38,8 +36,7 @@ async fn watch_new_redis_list_items(
 
     tokio::spawn(async move {
         loop {
-            let items = get_entity_from_database(&redis_url, &list_key)
-                .unwrap_or_default();
+            let items = get_entity_from_database(&redis_url, &list_key).unwrap_or_default();
 
             for item in items {
                 if known_items.insert(item.clone()) {
@@ -52,7 +49,7 @@ async fn watch_new_redis_list_items(
                 match stream.next().await {
                     Some(Ok(_)) => break,
                     Some(Err(e)) => error!("Error when waiting for redis updates: {}", e),
-                    None => ()
+                    None => (),
                 }
             }
         }
@@ -69,7 +66,8 @@ async fn watch_new_redis_list_items(
 /// TODO: use r2r/rcl to get the information
 async fn determine_topic_action(topic_name: String) -> String {
     let out = Command::new("ros2")
-        .arg("topic").arg("info")
+        .arg("topic")
+        .arg("info")
         .arg(topic_name.as_str())
         .output()
         .await
@@ -90,11 +88,7 @@ async fn determine_topic_action(topic_name: String) -> String {
 // action="sub": WebRTC → ros_publisher → local ROS
 // action="pub": local ROS → ros_subscriber → WebRTC
 pub async fn ros_topic_creator(
-    stream: DataStream,
-    node_name: String,
-    topic_name: String,
-    topic_type: String,
-    action: String,
+    stream: DataStream, node_name: String, topic_name: String, topic_type: String, action: String,
     certificate: Vec<u8>,
 ) {
     info!(
@@ -135,10 +129,7 @@ pub async fn ros_topic_creator(
 // 2. For each subscriber, create WebRTC connection and listen
 // 3. Watch Redis for new subscribers and connect dynamically
 async fn create_network_to_ros_bridge(
-    topic_gdp: GDPName,
-    topic_name: String,
-    topic_type: String,
-    certificate: Vec<u8>,
+    topic_gdp: GDPName, topic_name: String, topic_type: String, certificate: Vec<u8>,
 ) {
     let redis_url = get_redis_url();
     let publisher_side_gdp = generate_random_gdp_name();
@@ -156,23 +147,21 @@ async fn create_network_to_ros_bridge(
             new_subscriber
         );
 
-        add_entity_to_database_as_transaction(
-            &redis_url,
-            &publisher_topic,
-            &publisher_url,
-        )
-        .expect("Cannot add publisher entry");
+        add_entity_to_database_as_transaction(&redis_url, &publisher_topic, &publisher_url)
+            .expect("Cannot add publisher entry");
 
-        let stream = register_webrtc_stream(&publisher_url, None).await;
+        let topic_name = topic_name.clone();
+        let topic_type = topic_type.clone();
+        let certificate = certificate.clone();
 
-        tokio::spawn(ros_topic_creator(
-            stream,
+        tokio::spawn(async move { ros_topic_creator(
+            register_webrtc_stream(&publisher_url, None).await,
             format!("ros_manager_node_{}", rand::random::<u32>()),
-            topic_name.clone(),
-            topic_type.clone(),
+            topic_name,
+            topic_type,
             "sub".into(),
-            certificate.clone(),
-        ));
+            certificate,
+        ).await });
     }
 }
 
@@ -182,10 +171,7 @@ async fn create_network_to_ros_bridge(
 // 3. Connect to publishers with matching signaling URLs
 // 4. Watch Redis for new publishers and connect dynamically
 async fn create_ros_to_network_bridge(
-    topic_gdp: GDPName,
-    topic_name: String,
-    topic_type: String,
-    certificate: Vec<u8>,
+    topic_gdp: GDPName, topic_name: String, topic_type: String, certificate: Vec<u8>,
 ) {
     let redis_url = get_redis_url();
     let subscriber_side_gdp = generate_random_gdp_name();
@@ -229,16 +215,20 @@ async fn create_ros_to_network_bridge(
             gdp_name_to_string(subscriber_side_gdp)
         );
 
-        let stream = register_webrtc_stream(&my_url, Some(peer_url)).await;
+        let topic_name = topic_name.clone();
+        let topic_type = topic_type.clone();
+        let certificate = certificate.clone();
 
-        tokio::spawn(ros_topic_creator(
-            stream,
-            format!("ros_manager_node_{}", rand::random::<u32>()),
-            topic_name.clone(),
-            topic_type.clone(),
-            "pub".into(),
-            certificate.clone(),
-        ));
+        tokio::spawn(async move {
+            ros_topic_creator(
+                register_webrtc_stream(&my_url, Some(peer_url)).await,
+                format!("ros_manager_node_{}", rand::random::<u32>()),
+                topic_name,
+                topic_type,
+                "pub".into(),
+                certificate,
+            ).await
+        });
     }
 }
 
@@ -255,8 +245,7 @@ pub async fn ros_topic_manager() {
     let config = AppConfig::fetch().unwrap();
     let certificate = std::fs::read(format!(
         "./scripts/crypto/{}/{}-private.pem",
-        config.crypto_name,
-        config.crypto_name
+        config.crypto_name, config.crypto_name
     ))
     .expect("crypto file missing");
 
@@ -280,15 +269,13 @@ pub async fn ros_topic_manager() {
             let ttype = types[0].clone();
             let action = determine_topic_action(tname.clone()).await;
 
-            let gdp = GDPName(get_gdp_name_from_topic(
-                &tname,
-                &ttype,
-                &certificate,
-            ));
+            let gdp = GDPName(get_gdp_name_from_topic(&tname, &ttype, &certificate));
 
             topic_status.insert(
                 tname.clone(),
-                RosTopicStatus { action: action.clone() },
+                RosTopicStatus {
+                    action: action.clone(),
+                },
             );
 
             match action.as_str() {

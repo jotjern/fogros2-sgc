@@ -229,8 +229,6 @@ async fn create_ros_to_network_bridge(
             gdp_name_to_string(subscriber_side_gdp)
         );
 
-        sleep(Duration::from_millis(1000)).await;
-
         let stream = register_webrtc_stream(&my_url, Some(peer_url)).await;
 
         tokio::spawn(ros_topic_creator(

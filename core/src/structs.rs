@@ -239,8 +239,12 @@ pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
 
 pub fn string_to_gdp_name(name: &str) -> GDPName {
     let mut bytes = [0u8; 4];
-    for (i, byte) in name.as_bytes().chunks(2).enumerate() {
-        bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16).unwrap();
+    for (i, chunk) in name.as_bytes().chunks(2).take(4).enumerate() {
+        if let Ok(chunk_str) = std::str::from_utf8(chunk) {
+            if let Ok(val) = u8::from_str_radix(chunk_str, 16) {
+                bytes[i] = val;
+            }
+        }
     }
     GDPName(bytes)
 }

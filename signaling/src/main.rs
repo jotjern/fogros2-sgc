@@ -122,11 +122,9 @@ fn remove_client_from_rib(client_id: &str) {
     // For publisher-side format (topic,pub,sub): extracts pub → removal fails (expected)
     // For subscriber-side format (topic,sub,pub): extracts sub → removal succeeds
     let subscriber_name = client_id
-        .split(',')
-        .skip(4)
-        .take(4)
-        .collect::<Vec<&str>>()
-        .join(",");
+        .split('-')
+        .nth(1)
+        .unwrap();
 
     // Remove subscriber_name from the subscriber list in Redis
     let result: Result<isize, redis::RedisError> =

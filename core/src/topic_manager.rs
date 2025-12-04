@@ -178,7 +178,7 @@ async fn create_network_to_ros_bridge(
             None => break,
             Some(RedisListChange::Added(subscriber)) => {
                 let publisher_url = format!(
-                    "{},{},{}",
+                    "{}-{}-{}",
                     gdp_name_to_string(topic_gdp),
                     gdp_name_to_string(publisher_side_gdp),
                     subscriber
@@ -247,21 +247,19 @@ async fn create_ros_to_network_bridge(
                 }
 
                 let remote = publisher
-                    .split(',')
-                    .skip(4)
-                    .take(4)
-                    .collect::<Vec<&str>>()
-                    .join(",");
+                    .split('-')
+                    .nth(1)
+                    .unwrap();
 
                 let my_url = format!(
-                    "{},{},{}",
+                    "{}-{}-{}",
                     gdp_name_to_string(topic_gdp),
                     gdp_name_to_string(subscriber_side_gdp),
                     remote
                 );
 
                 let peer_url = format!(
-                    "{},{},{}",
+                    "{}-{}-{}",
                     gdp_name_to_string(topic_gdp),
                     remote,
                     gdp_name_to_string(subscriber_side_gdp)

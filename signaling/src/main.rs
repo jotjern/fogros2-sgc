@@ -83,10 +83,9 @@ fn remove_client_from_rib(client_id: &str) {
 
     // Build topic key using the first 4 comma-separated elements of client_id
     let topic_key_name = client_id
-        .split(',')
-        .take(4)
-        .collect::<Vec<&str>>()
-        .join(",");
+        .split('-')
+        .next()
+        .unwrap();
     // Publisher and subscriber Redis list keys
     let publisher_topic = format!("{}-pub", topic_key_name.clone());
     let subscriber_topic = format!("{}-sub", topic_key_name.clone());

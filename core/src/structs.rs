@@ -234,7 +234,7 @@ pub struct GDPStatus {
 
 // Convert GDPName to comma-separated string for Redis keys (e.g., "167,229,32,134")
 pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
-    format!("{},{},{},{}", name[0], name[1], name[2], name[3])
+    format!("{:x}{:x}{:x}{:x}", name[0], name[1], name[2], name[3])
 }
 
 pub fn string_to_gdp_name(name: &str) -> GDPName {

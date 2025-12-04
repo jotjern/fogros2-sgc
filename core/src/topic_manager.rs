@@ -10,13 +10,19 @@ use std::collections::{HashMap, HashSet};
 use tokio::process::Command;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use tokio::time::{sleep, Duration};
+use tokio::task::JoinHandle;
 use utils::app_config::AppConfig;
 
 use crate::db::*;
 use futures::StreamExt;
 use redis_async::client;
 
-async fn watch_new_redis_list_items(list_key: String) -> UnboundedReceiver<String> {
+enum RedisListChange {
+    Added(String),
+    Removed(String),
+}
+
+async fn watch_redis_list_items(list_key: String) -> UnboundedReceiver<RedisListChange> {
     let redis_url = get_redis_url();
     allow_keyspace_notification(&redis_url).unwrap();
 
@@ -35,13 +41,27 @@ async fn watch_new_redis_list_items(list_key: String) -> UnboundedReceiver<Strin
     let mut known_items = HashSet::<String>::new();
 
     tokio::spawn(async move {
-        loop {
-            let items = get_entity_from_database(&redis_url, &list_key).unwrap_or_default();
+        while !tx.is_closed() {
+            let items: HashSet<String> = get_entity_from_database(&redis_url, &list_key)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
 
-            for item in items {
+            for item in &items {
                 if known_items.insert(item.clone()) {
-                    let _ = tx.send(item);
+                    let _ = tx.send(RedisListChange::Added(item.clone()));
                 }
+            }
+
+            let to_remove: Vec<String> = known_items
+                .iter()
+                .filter(|item| !items.contains(*item))
+                .cloned()
+                .collect();
+
+            for item in to_remove {
+                known_items.remove(&item);
+                let _ = tx.send(RedisListChange::Removed(item));
             }
 
             // Wait for a notification from the redis server
@@ -84,13 +104,12 @@ async fn determine_topic_action(topic_name: String) -> String {
     }
 }
 
-// Bridge between WebRTC DataStream and local ROS topic
-// action="sub": WebRTC → ros_publisher → local ROS
-// action="pub": local ROS → ros_subscriber → WebRTC
+// Bridge between WebRTC DataStream and local ROS topic.
+// Returns a JoinHandle so callers can abort the whole bridge.
 pub async fn ros_topic_creator(
     stream: DataStream, node_name: String, topic_name: String, topic_type: String, action: String,
     certificate: Vec<u8>,
-) {
+) -> JoinHandle<()> {
     info!(
         "topic creator for topic {}, type {}, action {}",
         topic_name, topic_type, action
@@ -99,29 +118,43 @@ pub async fn ros_topic_creator(
     // rtc_tx/rx: messages from ROS to WebRTC
     let (ros_tx, ros_rx) = unbounded_channel();
     let (rtc_tx, rtc_rx) = unbounded_channel();
-    tokio::spawn(webrtc_reader_and_writer(stream, ros_tx.clone(), rtc_rx));
+    tokio::spawn(async move {
+        let mut webrtc_fut = webrtc_reader_and_writer(stream, ros_tx, rtc_rx);
+        tokio::pin!(webrtc_fut);
 
-    match action.as_str() {
-        "sub" => {
-            tokio::spawn(ros_subscriber(
-                node_name,
-                topic_name,
-                topic_type,
-                certificate,
-                rtc_tx,
-            ));
-        }
-        "pub" => {
-            tokio::spawn(ros_publisher(
-                node_name,
-                topic_name,
-                topic_type,
-                certificate,
-                ros_rx,
-            ));
-        }
-        _ => panic!("unknown action"),
-    };
+        match action.as_str() {
+            "sub" => {
+                let mut ros_fut = ros_subscriber(
+                    node_name,
+                    topic_name,
+                    topic_type,
+                    certificate,
+                    rtc_tx,
+                );
+                tokio::pin!(ros_fut);
+                tokio::select! {
+                    _ = &mut webrtc_fut => {},
+                    _ = &mut ros_fut => {},
+                }
+            }
+            "pub" => {
+                let mut ros_fut = ros_publisher(
+
+                    node_name,
+                    topic_name,
+                    topic_type,
+                    certificate,
+                    ros_rx,
+                );
+                tokio::pin!(ros_fut);
+                tokio::select! {
+                    _ = &mut webrtc_fut => {},
+                    _ = &mut ros_fut => {},
+                }
+            }
+            _ => panic!("unknown action"),
+        };
+    })
 }
 
 // This node receives from remote and publishes to local ROS
@@ -137,31 +170,46 @@ async fn create_network_to_ros_bridge(
     let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp));
     let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp));
 
-    let mut changes = watch_new_redis_list_items(subscriber_topic.clone()).await;
+    let mut redis_changes_channel = watch_redis_list_items(subscriber_topic.clone()).await;
+    let mut connections: HashMap<String, JoinHandle<()>> = HashMap::new();
 
-    while let Some(new_subscriber) = changes.recv().await {
-        let publisher_url = format!(
-            "{},{},{}",
-            gdp_name_to_string(topic_gdp),
-            gdp_name_to_string(publisher_side_gdp),
-            new_subscriber
-        );
+    loop {
+        match redis_changes_channel.recv().await {
+            None => break,
+            Some(RedisListChange::Added(subscriber)) => {
+                let publisher_url = format!(
+                    "{},{},{}",
+                    gdp_name_to_string(topic_gdp),
+                    gdp_name_to_string(publisher_side_gdp),
+                    subscriber
+                );
 
-        add_entity_to_database_as_transaction(&redis_url, &publisher_topic, &publisher_url)
-            .expect("Cannot add publisher entry");
+                add_entity_to_database_as_transaction(&redis_url, &publisher_topic, &publisher_url)
+                    .expect("Cannot add publisher entry");
 
-        let topic_name = topic_name.clone();
-        let topic_type = topic_type.clone();
-        let certificate = certificate.clone();
+                let topic_name = topic_name.clone();
+                let topic_type = topic_type.clone();
+                let certificate = certificate.clone();
 
-        tokio::spawn(async move { ros_topic_creator(
-            register_webrtc_stream(&publisher_url, None).await,
-            format!("ros_manager_node_{}", rand::random::<u32>()),
-            topic_name,
-            topic_type,
-            "sub".into(),
-            certificate,
-        ).await });
+                let handle = ros_topic_creator(
+                    register_webrtc_stream(&publisher_url, None).await,
+                    format!("ros_manager_node_{}", rand::random::<u32>()),
+                    topic_name,
+                    topic_type,
+                    "sub".into(),
+                    certificate,
+                )
+                .await;
+                connections.insert(subscriber.clone(), handle);
+                info!("Added remote subscriber: {}", subscriber);
+            }
+            Some(RedisListChange::Removed(removed_subscriber)) => {
+                if let Some(handle) = connections.remove(&removed_subscriber) {
+                    handle.abort();
+                }
+                info!("Removed remote subscriber: {}", removed_subscriber);
+            }
+        }
     }
 }
 
@@ -187,48 +235,62 @@ async fn create_ros_to_network_bridge(
     )
     .expect("add subscriber");
 
-    let mut changes = watch_new_redis_list_items(publisher_topic.clone()).await;
+    let mut redis_changes_channel = watch_redis_list_items(publisher_topic.clone()).await;
+    let mut connections: HashMap<String, JoinHandle<()>> = HashMap::new();
 
-    while let Some(publisher) = changes.recv().await {
-        if !publisher.ends_with(&gdp_name_to_string(subscriber_side_gdp.clone())) {
-            continue;
+    loop {
+        match redis_changes_channel.recv().await {
+            None => break,
+            Some(RedisListChange::Added(publisher)) => {
+                if !publisher.ends_with(&gdp_name_to_string(subscriber_side_gdp.clone())) {
+                    continue;
+                }
+
+                let remote = publisher
+                    .split(',')
+                    .skip(4)
+                    .take(4)
+                    .collect::<Vec<&str>>()
+                    .join(",");
+
+                let my_url = format!(
+                    "{},{},{}",
+                    gdp_name_to_string(topic_gdp),
+                    gdp_name_to_string(subscriber_side_gdp),
+                    remote
+                );
+
+                let peer_url = format!(
+                    "{},{},{}",
+                    gdp_name_to_string(topic_gdp),
+                    remote,
+                    gdp_name_to_string(subscriber_side_gdp)
+                );
+
+                let topic_name = topic_name.clone();
+                let topic_type = topic_type.clone();
+                let certificate = certificate.clone();
+
+                let handle = ros_topic_creator(
+                    register_webrtc_stream(&my_url, Some(peer_url)).await,
+                    format!("ros_manager_node_{}", rand::random::<u32>()),
+                    topic_name,
+                    topic_type,
+                    "pub".into(),
+                    certificate,
+                )
+                .await;
+                connections.insert(publisher.clone(), handle);
+
+                info!("Added remote publisher: {}", publisher);
+            },
+            Some(RedisListChange::Removed(publisher)) => {
+                if let Some(handle) = connections.remove(&publisher) {
+                    handle.abort();
+                }
+                info!("Removed remote publisher: {}", publisher);
+            }
         }
-
-        let remote = publisher
-            .split(',')
-            .skip(4)
-            .take(4)
-            .collect::<Vec<&str>>()
-            .join(",");
-
-        let my_url = format!(
-            "{},{},{}",
-            gdp_name_to_string(topic_gdp),
-            gdp_name_to_string(subscriber_side_gdp),
-            remote
-        );
-
-        let peer_url = format!(
-            "{},{},{}",
-            gdp_name_to_string(topic_gdp),
-            remote,
-            gdp_name_to_string(subscriber_side_gdp)
-        );
-
-        let topic_name = topic_name.clone();
-        let topic_type = topic_type.clone();
-        let certificate = certificate.clone();
-
-        tokio::spawn(async move {
-            ros_topic_creator(
-                register_webrtc_stream(&my_url, Some(peer_url)).await,
-                format!("ros_manager_node_{}", rand::random::<u32>()),
-                topic_name,
-                topic_type,
-                "pub".into(),
-                certificate,
-            ).await
-        });
     }
 }
 

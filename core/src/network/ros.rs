@@ -5,12 +5,10 @@ use futures::stream::StreamExt;
 
 #[cfg(feature = "ros")]
 use r2r::QosProfile;
-use serde_json;
 
-use std::str;
-use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task;
 
 // Publishes messages to local ROS (receives from WebRTC)
 #[cfg(feature = "ros")]
@@ -38,26 +36,23 @@ pub async fn ros_publisher(
         .create_publisher_untyped(&topic_name, &topic_type, QosProfile::default())
         .expect("publisher creation failure");
 
-    let _handle = tokio::task::spawn_blocking(move || loop {
+    let _handle = task::spawn_blocking(move || loop {
         node.spin_once(std::time::Duration::from_millis(10));
         std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
-    loop {
-        tokio::select! {
-            Some(pkt_to_forward) = m_rx.recv() => {
-                if pkt_to_forward.action == GdpAction::Forward {
-                    info!("new payload to publish ");
-                    if pkt_to_forward.gdpname == topic_gdp_name {
-                        let payload = pkt_to_forward.get_byte_payload().unwrap();
-                        //let ros_msg = serde_json::from_str(str::from_utf8(payload).unwrap()).expect("json parsing failure");
-                        // info!("the decoded payload to publish is {:?}", ros_msg);
-                        publisher.publish(payload.clone()).unwrap();
-                    } else{
-                        info!("{:?} received a packet for name {:?}",pkt_to_forward.gdpname, topic_gdp_name);
-                    }
-                }
-            },
+    while let Some(pkt_to_forward) = m_rx.recv().await {
+        if pkt_to_forward.action == GdpAction::Forward {
+            info!("new payload to publish ");
+            if pkt_to_forward.gdpname == topic_gdp_name {
+                let payload = pkt_to_forward.get_byte_payload().unwrap();
+                publisher.publish(payload.clone()).unwrap();
+            } else {
+                info!(
+                    "{:?} received a packet for name {:?}",
+                    pkt_to_forward.gdpname, topic_gdp_name
+                );
+            }
         }
     }
 }
@@ -88,28 +83,15 @@ pub async fn ros_subscriber(
         .subscribe_untyped(&topic_name, &topic_type, QosProfile::default())
         .expect("topic subscribing failure");
 
-    let _handle = tokio::task::spawn_blocking(move || loop {
+    let _handle = task::spawn_blocking(move || loop {
         node.spin_once(std::time::Duration::from_millis(10));
         std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
-    loop {
-        tokio::select! {
-            Some(packet) = subscriber.next() => {
-                info!("received a packet {:?}", packet);
-                let ros_msg = packet;
-                let packet = construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg );
-                m_tx.send(packet);
-
-                // proc_gdp_packet(packet,  // packet
-                //     &fib_tx,  //used to send packet to fib
-                //     &channel_tx, // used to send GDPChannel to fib
-                //     &m_tx, //the sending handle of this connection
-                //     &rib_query_tx, // used to send GDPNameRecord to rib
-                //     "".to_string(),
-                // ).await;
-
-            }
-        }
+    while let Some(packet) = subscriber.next().await {
+        info!("received a packet {:?}", packet);
+        let ros_msg = packet;
+        let packet = construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg);
+        let _ = m_tx.send(packet);
     }
 }

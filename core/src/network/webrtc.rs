@@ -255,7 +255,14 @@ pub async fn webrtc_reader_and_writer(
             // ========================================
             // RECEIVE: WebRTC → ROS
             // ========================================
-            Ok(receiving_buf_size) = stream.read(&mut receiving_buf) => {
+            read_res = stream.read(&mut receiving_buf) => {
+                let receiving_buf_size = match read_res {
+                    Ok(sz) => sz,
+                    Err(e) => {
+                        warn!("Connection closed during read: {}", e);
+                        break;
+                    }
+                };
                 let mut receiving_buf = receiving_buf[..receiving_buf_size].to_vec();
                 info!("read {} bytes", receiving_buf_size);
 
@@ -348,7 +355,10 @@ pub async fn webrtc_reader_and_writer(
             // ========================================
             // SEND: ROS → WebRTC
             // ========================================
-            Some(pkt_to_forward) = rtc_rx.recv() => {
+            maybe_pkt_to_forward = rtc_rx.recv() => {
+                let Some(pkt_to_forward) = maybe_pkt_to_forward else {
+                    break;
+                };
                 let transit_header = pkt_to_forward.get_header();
                 let mut header_string = serde_json::to_string(&transit_header).unwrap();
                 info!("the header size is {}", header_string.len());

@@ -1,7 +1,7 @@
 use crate::network::ros::{ros_publisher, ros_subscriber};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
 use crate::structs::{
-    gdp_name_to_string, generate_random_gdp_name, get_gdp_name_from_topic, GDPName,
+    generate_random_gdp_name, get_gdp_name_from_topic, GDPName,
 };
 
 use async_datachannel::DataStream;
@@ -167,8 +167,8 @@ async fn create_network_to_ros_bridge(
     let redis_url = get_redis_url();
     let publisher_side_gdp = generate_random_gdp_name();
 
-    let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp));
-    let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp));
+    let publisher_topic = format!("{}-publishers", topic_gdp);
+    let subscriber_topic = format!("{}-sub", topic_gdp);
 
     let mut redis_changes_channel = watch_redis_list_items(subscriber_topic.clone()).await;
     let mut connections: HashMap<String, JoinHandle<()>> = HashMap::new();
@@ -179,8 +179,8 @@ async fn create_network_to_ros_bridge(
             Some(RedisListChange::Added(subscriber)) => {
                 let publisher_url = format!(
                     "{}-{}-{}",
-                    gdp_name_to_string(topic_gdp),
-                    gdp_name_to_string(publisher_side_gdp),
+                    topic_gdp,
+                    publisher_side_gdp,
                     subscriber
                 );
 
@@ -224,14 +224,14 @@ async fn create_ros_to_network_bridge(
     let redis_url = get_redis_url();
     let subscriber_side_gdp = generate_random_gdp_name();
 
-    let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp));
-    let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp));
+    let publisher_topic = format!("{}-pub", topic_gdp);
+    let subscriber_topic = format!("{}-sub", topic_gdp);
 
     // Announce presence to publishers by adding GUID to {topic}-sub
     add_entity_to_database_as_transaction(
         &redis_url,
         &subscriber_topic,
-        gdp_name_to_string(subscriber_side_gdp.clone()).as_str(),
+        &subscriber_side_gdp.to_string(),
     )
     .expect("add subscriber");
 
@@ -242,7 +242,7 @@ async fn create_ros_to_network_bridge(
         match redis_changes_channel.recv().await {
             None => break,
             Some(RedisListChange::Added(publisher)) => {
-                if !publisher.ends_with(&gdp_name_to_string(subscriber_side_gdp.clone())) {
+                if !publisher.ends_with(&subscriber_side_gdp.to_string()) {
                     continue;
                 }
 
@@ -253,16 +253,16 @@ async fn create_ros_to_network_bridge(
 
                 let my_url = format!(
                     "{}-{}-{}",
-                    gdp_name_to_string(topic_gdp),
-                    gdp_name_to_string(subscriber_side_gdp),
+                    topic_gdp,
+                    subscriber_side_gdp,
                     remote
                 );
 
                 let peer_url = format!(
                     "{}-{}-{}",
-                    gdp_name_to_string(topic_gdp),
+                    topic_gdp,
                     remote,
-                    gdp_name_to_string(subscriber_side_gdp)
+                    subscriber_side_gdp
                 );
 
                 let topic_name = topic_name.clone();

@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use rand::Rng;
 use std::fmt;
+use std::num::ParseIntError;
+use std::str::FromStr;
 use strum_macros::EnumIter;
 use tokio::sync::mpsc::UnboundedSender;
 pub const MAGIC_NUMBERS: u16 = u16::from_be_bytes([0x26, 0x2a]);
@@ -66,7 +68,26 @@ impl From<u16be> for u16 {
 pub struct GDPName(pub [u8; 4]);
 impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(
+            f,
+            "{:x}{:x}{:x}{:x}",
+            self.0[0], self.0[1], self.0[2], self.0[3]
+        )?;
+        Ok(())
+    }
+}
+
+impl FromStr for GDPName {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let mut bytes = [0u8; 4];
+        for (i, chunk) in s.as_bytes().chunks(2).take(4).enumerate() {
+            if let Ok(chunk_str) = std::str::from_utf8(chunk) {
+                bytes[i] = u8::from_str_radix(chunk_str, 16)?;
+            }
+        }
+        Ok(GDPName(bytes))
     }
 }
 
@@ -235,16 +256,4 @@ pub struct GDPStatus {
 // Convert GDPName to comma-separated string for Redis keys (e.g., "167,229,32,134")
 pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
     format!("{:x}{:x}{:x}{:x}", name[0], name[1], name[2], name[3])
-}
-
-pub fn string_to_gdp_name(name: &str) -> GDPName {
-    let mut bytes = [0u8; 4];
-    for (i, chunk) in name.as_bytes().chunks(2).take(4).enumerate() {
-        if let Ok(chunk_str) = std::str::from_utf8(chunk) {
-            if let Ok(val) = u8::from_str_radix(chunk_str, 16) {
-                bytes[i] = val;
-            }
-        }
-    }
-    GDPName(bytes)
 }

@@ -60,6 +60,20 @@ enum Commands {
     )]
     Router,
     #[clap(
+        name = "proxy",
+        about = "Run WebRTC Relay Proxy",
+        long_about = None,
+    )]
+    Proxy {
+        /// Unique identifier for this proxy (e.g., P1, P2)
+        #[clap(short, long)]
+        id: String,
+        
+        /// Redis server address (host:port like rib:6379)
+        #[clap(long)]
+        redis: String,
+    },
+    #[clap(
         name = "client",
         about = "Run test dtls client",
         long_about = None,
@@ -106,6 +120,7 @@ pub fn cli_match() -> Result<()> {
     // Execute the subcommand
     match &cli.command {
         Commands::Router => commands::router()?,
+        Commands::Proxy { id, redis } => commands::proxy(id.clone(), Some(redis.clone()))?,
         Commands::Error => commands::simulate_error()?,
         Commands::Completion { subcommand } => {
             let mut app = Cli::into_app();

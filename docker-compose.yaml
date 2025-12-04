@@ -47,6 +47,7 @@ services:
           bash -c "source /opt/ros/humble/setup.bash; 
           ros2 run demo_nodes_py talker & 
           /gdp-router router"
+
     listener:
         restart: always
         build: 
@@ -59,7 +60,7 @@ services:
           - rib
           - signal
         deploy:
-          replicas: 10
+          replicas: 3
         environment:
           SGC_CONFIG: "automatic-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
@@ -71,4 +72,31 @@ services:
           bash -c "source /opt/ros/humble/setup.bash; 
           ros2 run demo_nodes_py listener & 
           /gdp-router router"
-          
+
+    proxy1:
+      restart: always
+      build: 
+        context: ./
+        dockerfile: ./Dockerfile
+      depends_on:
+        - rib 
+        - signal
+      environment:
+        SGC_CONFIG: "automatic-docker.toml"
+      init: true
+      command: >
+        /gdp-router proxy --id P1 --redis rib:6379
+
+    proxy2:
+      restart: always
+      build: 
+        context: ./
+        dockerfile: ./Dockerfile
+      depends_on:
+        - rib
+        - signal
+      environment:
+        SGC_CONFIG: "automatic-docker.toml"
+      init: true
+      command: >
+        /gdp-router proxy --id P2 --redis rib:6379

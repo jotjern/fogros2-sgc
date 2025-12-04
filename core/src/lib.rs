@@ -7,10 +7,15 @@ pub mod network;
 pub mod structs;
 
 pub mod rib;
+
 // network processing
 pub mod connection_fib;
 pub mod db;
 pub mod pipeline;
+
+// proxy
+pub mod proxy;
+
 // util
 pub mod commands;
 pub mod topic_manager;

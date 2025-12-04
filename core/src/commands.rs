@@ -4,6 +4,8 @@ extern crate tokio_core;
 use crate::topic_manager::ros_topic_manager;
 use futures::future;
 
+use crate::proxy::Proxy;
+
 use utils::app_config::AppConfig;
 use utils::error::Result;
 
@@ -39,6 +41,18 @@ pub fn config() -> Result<()> {
 
     Ok(())
 }
+
+
+#[tokio::main]
+pub async fn proxy(id: String, redis: Option<String>) -> Result<()> {
+    warn!("proxy is started with id: {}", id);
+    
+    let mut proxy = Proxy::new(id, redis).await.expect("Failed to create proxy");
+    proxy.run().await.expect("Proxy failed");
+    
+    Ok(())
+}
+
 #[tokio::main]
 /// Simulate an error
 pub async fn simulate_error() -> Result<()> {

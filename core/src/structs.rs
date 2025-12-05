@@ -70,7 +70,7 @@ impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "{:x}{:x}{:x}{:x}",
+            "{:02x}{:02x}{:02x}{:02x}",
             self.0[0], self.0[1], self.0[2], self.0[3]
         )?;
         Ok(())
@@ -256,4 +256,31 @@ pub struct GDPStatus {
 // Convert GDPName to comma-separated string for Redis keys (e.g., "167,229,32,134")
 pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
     format!("{:x}{:x}{:x}{:x}", name[0], name[1], name[2], name[3])
+}
+
+pub struct Connection {
+  pub publisher: GDPName,
+  pub subscriber: GDPName
+}
+
+impl ToString for Connection {
+    fn to_string(&self) -> String {
+      format!("{}-{}", self.publisher, self.subscriber)
+    }
+}
+
+impl FromStr for Connection {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+      let mut parts = s.split("-");
+
+      let publisher = GDPName::from_str(parts.next().unwrap())?;
+      let subscriber = GDPName::from_str(parts.next().unwrap())?;
+
+      Ok(Connection {
+        publisher,
+        subscriber
+      })
+    }
 }

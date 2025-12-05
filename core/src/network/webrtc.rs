@@ -14,9 +14,10 @@ use futures::{
     io::{AsyncReadExt, AsyncWriteExt},
     SinkExt, StreamExt,
 };
+use tokio::sync::broadcast;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use utils::app_config::AppConfig;
 
 // Buffer size for receiving WebRTC data chunks (1.7MB)
@@ -117,8 +118,14 @@ struct SignalingMessage {
 /// - `peer_to_dial`: If Some, initiates connection; if None, waits for incoming connection
 ///
 /// # Returns
-/// An established WebRTC DataStream for bidirectional communication
-pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -> DataStream {
+/// An established WebRTC DataStream for bidirectional communication, plus a shutdown signal
+/// that cleanly stops signaling tasks (useful when reconnecting with the same ID).
+pub async fn register_webrtc_stream(
+    my_id: &str,
+    peer_to_dial: Option<String>,
+) -> (DataStream, broadcast::Sender<()>) {
+    // Own my_id so it can be moved into spawned tasks safely
+    let my_id = my_id.to_string();
     let config = AppConfig::fetch().expect("Failed to fetch config");
     
     // Configure WebRTC with Google's public STUN server for NAT traversal
@@ -130,6 +137,7 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     let (tx_sig_outbound, mut rx_sig_outbound) = mpsc::channel(32);
     let (mut tx_sig_inbound, rx_sig_inbound) = mpsc::channel(32);
     let listener = PeerConnection::new(&conf, (tx_sig_outbound, rx_sig_inbound)).unwrap();
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Connect to signaling server via WebSocket
     let signaling_uri = config.signaling_server_address;
@@ -146,20 +154,31 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     // specifying the intended peer's ID, serializes it to JSON, and sends it over the
     // WebSocket connection to the signaling server, which relays it to the remote peer.
     // If sending fails, an error is logged and the loop breaks.
+    let mut shutdown_rx_w = shutdown_rx.resubscribe();
+    let my_id_write = my_id.clone();
     let f_write = async move {
-        while let Some(m) = rx_sig_outbound.next().await {
-            let m = SignalingMessage {
-                payload: m,
-                id: other_peer_c.lock().as_ref().cloned().unwrap(),
-            };
-            let s = serde_json::to_string(&m).unwrap();
-            info!("Sending {:?}", s);
-            match write.send(tungstenite::Message::text(s)).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error sending {:?}", e);
+        loop {
+            tokio::select! {
+                _ = shutdown_rx_w.recv() => {
+                    info!("Stopping signaling writer for {}", my_id_write);
                     break;
                 }
+                Some(m) = rx_sig_outbound.next() => {
+                    let m = SignalingMessage {
+                        payload: m,
+                        id: other_peer_c.lock().as_ref().cloned().unwrap(),
+                    };
+                    let s = serde_json::to_string(&m).unwrap();
+                    info!("Sending {:?}", s);
+                    match write.send(tungstenite::Message::text(s)).await {
+                        Ok(_) => (),
+                        Err(e) => {
+                            error!("Error sending {:?}", e);
+                            break;
+                        }
+                    }
+                }
+                else => break,
             }
         }
         anyhow::Result::<_, anyhow::Error>::Ok(())
@@ -168,25 +187,44 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     
     // Task: Receive inbound signaling messages from peer via signaling server
     // Similar to the f_write task above
+    let mut shutdown_rx_r = shutdown_rx.resubscribe();
+    let my_id_read = my_id.clone();
     let f_read = async move {
-        while let Some(Ok(m)) = read.next().await {
-            info!("received {:?}", m);
-            if let Some(val) = match m {
-                tungstenite::Message::Text(t) => {
-                    Some(serde_json::from_str::<serde_json::Value>(&t).unwrap())
+        loop {
+            tokio::select! {
+                _ = shutdown_rx_r.recv() => {
+                    info!("Stopping signaling reader for {}", my_id_read);
+                    break;
                 }
-                tungstenite::Message::Binary(b) => Some(serde_json::from_slice(&b[..]).unwrap()),
-                tungstenite::Message::Close(e) => {
-                    warn!("close message {:?}", e);
-                    continue;
-                }
-                _ => None,
-            } {
-                let c: SignalingMessage = serde_json::from_value(val).unwrap();
-                info!("msg {:?}", c);
-                other_peer.lock().replace(c.id);
-                if tx_sig_inbound.send(c.payload).await.is_err() {
-                    panic!()
+                maybe_msg = read.next() => {
+                    match maybe_msg {
+                        Some(Ok(m)) => {
+                            info!("received {:?}", m);
+                            if let Some(val) = match m {
+                                tungstenite::Message::Text(t) => {
+                                    Some(serde_json::from_str::<serde_json::Value>(&t).unwrap())
+                                }
+                                tungstenite::Message::Binary(b) => Some(serde_json::from_slice(&b[..]).unwrap()),
+                                tungstenite::Message::Close(e) => {
+                                    warn!("close message {:?}", e);
+                                    continue;
+                                }
+                                _ => None,
+                            } {
+                                let c: SignalingMessage = serde_json::from_value(val).unwrap();
+                                info!("msg {:?}", c);
+                                other_peer.lock().replace(c.id);
+                                if tx_sig_inbound.send(c.payload).await.is_err() {
+                                    panic!()
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!("Error reading signaling message: {:?}", e);
+                            break;
+                        }
+                        None => break,
+                    }
                 }
             }
         }
@@ -209,7 +247,7 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
         info!("accept succeed");
         dc
     };
-    stream
+    (stream, shutdown_tx)
 }
 
 // ============================================================================

@@ -19,7 +19,7 @@ pub struct Database {
     pub url: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ROS {
     pub action: String,
     pub topic_name: String,
@@ -34,6 +34,7 @@ pub struct AppConfig {
     pub signaling_server_address: String,
     pub routing_information_base_address: String,
     pub automatic_topic_discovery: bool,
+    pub proxy: bool,
     pub ros: Vec<ROS>,
 }
 

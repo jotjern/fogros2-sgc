@@ -45,6 +45,18 @@ pub fn add_entity_to_database_as_transaction(
     Ok(())
 }
 
+pub fn remove_entity_from_database_as_transaction(
+    redis_url: &str, key: &str, value: &str,
+) -> RedisResult<()> {
+    let client = Client::open(redis_url)?;
+    let mut con = client.get_connection()?;
+    let (new_val,): (isize,) = transaction(&mut con, &[key], |con, pipe| {
+        pipe.lrem(key, 1, value).query(con)
+    })?;
+    println!("The incremented number is: {}", new_val);
+    Ok(())
+}
+
 // Get all publishers/subscribers from Redis list
 pub fn get_entity_from_database(redis_url: &str, key: &str) -> RedisResult<Vec<String>> {
     let client = Client::open(redis_url)?;

@@ -68,6 +68,11 @@ services:
           bash -c "source /opt/ros/humble/setup.bash; 
           ros2 run demo_nodes_py listener & 
           /gdp-router router"
+        healthcheck:
+          test: ["CMD-SHELL", "test -f /tmp/iheard && [ $(($(date +%s)-$(stat -c %Y /tmp/iheard))) -lt 2 ]"]
+          interval: 1s
+          timeout: 3s
+          retries: 100
     proxy:
         restart: always
         build: 
@@ -89,3 +94,8 @@ services:
         command: >
           bash -c "source /opt/ros/humble/setup.bash; 
           /gdp-router router"
+        healthcheck:
+          test: ["CMD-SHELL", "test -f /tmp/iheard && [ $(($(date +%s)-$(stat -c %Y /tmp/iheard))) -lt 2 ]"]
+          interval: 1s
+          timeout: 3s
+          retries: 100

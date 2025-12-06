@@ -15,16 +15,23 @@ io.on('connection', (socket) => {
   console.log('Client connected');
   let redis = null;
   let subscriber = null;
+  let debugSub = null;
+  let heartbeat = null;
 
   socket.on('connect-redis', async ({ host, port }) => {
     try {
       // Clean up existing connections
       if (redis) redis.disconnect();
       if (subscriber) subscriber.disconnect();
+      if (debugSub) debugSub.disconnect();
+      if (heartbeat) {
+        clearInterval(heartbeat);
+        heartbeat = null;
+      }
 
       const redisConfig = {
-        host: host || 'localhost',
-        port: port || 8002, // align with docker-compose exposed Redis port
+        host: host || process.env.REDIS_HOST || 'localhost',
+        port: port || parseInt(process.env.REDIS_PORT || '6379', 10),
         retryStrategy: () => null
       };
 
@@ -35,8 +42,13 @@ io.on('connection', (socket) => {
         socket.emit('redis-error', err.message);
       });
 
+      redis.on('end', () => {
+        socket.emit('redis-error', 'Redis connection closed');
+      });
+
       subscriber.on('error', (err) => {
         console.error('Subscriber error:', err.message);
+        socket.emit('redis-error', err.message);
       });
 
       await redis.ping();
@@ -52,6 +64,29 @@ io.on('connection', (socket) => {
         console.log(`Keyspace event: ${channel} -> ${message}`);
         fetchAndSend();
       });
+
+      // Separate subscriber for pub/sub channels to avoid overlap with psubscribe
+      debugSub = new Redis(redisConfig);
+      debugSub.on('message', (channel, msg) => {
+        if (channel !== 'debug-messages') return;
+        console.log('debug-messages ->', msg);
+        try {
+          const parsed = JSON.parse(msg);
+          socket.emit('debug-event', parsed);
+        } catch (e) {
+          socket.emit('debug-event', { raw: msg });
+        }
+      });
+      await debugSub.subscribe('debug-messages');
+      console.log('Subscribed to debug-messages channel');
+
+      heartbeat = setInterval(async () => {
+        try {
+          await redis.ping();
+        } catch (e) {
+          socket.emit('redis-error', 'Redis heartbeat failed');
+        }
+      }, 2000);
 
       // Initial fetch
       fetchAndSend();
@@ -113,6 +148,11 @@ io.on('connection', (socket) => {
     console.log('Client disconnected');
     if (redis) redis.disconnect();
     if (subscriber) subscriber.disconnect();
+    if (debugSub) debugSub.disconnect();
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
   });
 });
 

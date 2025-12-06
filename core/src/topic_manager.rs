@@ -1,5 +1,6 @@
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
+use crate::routing::attach_subscriber;
 use crate::structs::{Connection, GDPName, gdp_name_to_string, generate_random_gdp_name, get_gdp_name_from_topic};
 
 use std::collections::{HashMap, HashSet};
@@ -50,6 +51,7 @@ async fn handle_new_connection(
     let certificate_owned = certificate.clone();
     let my_signal_id_owned = my_signal_id.clone();
     let is_publisher = connection.publisher == my_gdp_name;
+    let my_gdp_name_owned = my_gdp_name;
 
     tokio::spawn(async move {
         let (webrtc_stream, webrtc_shutdown) =
@@ -87,6 +89,7 @@ async fn handle_new_connection(
                 topic_name_owned,
                 topic_type_owned,
                 certificate_owned,
+                my_gdp_name_owned,
                 ros_rx,
             ));
         }
@@ -223,83 +226,14 @@ pub async fn ros_topic_discovery() {
             }
             "sub" => {
                 tokio::time::sleep(Duration::from_millis(2000 + (rand::thread_rng().gen::<u64>() % 1000))).await;
-                let publishers = get_entity_from_database(&redis_url, &publishers_topic)
-                    .unwrap()
-                    .iter()
-                    .map(|gdp_name_string| GDPName::from_str(gdp_name_string).unwrap())
-                    .collect::<Vec<_>>();
-                info!(
-                    "Subscribers: looking for publisher on topic {} ({} candidates)",
-                    topic.topic_name,
-                    publishers.len()
+                let _ = attach_subscriber(
+                    &redis_url,
+                    &connections_topic,
+                    &publishers_topic,
+                    &proxy_topic,
+                    &topic.topic_name,
+                    my_gdp_name,
                 );
-
-                let mut connections_map = HashMap::new();
-                for connection in get_entity_from_database(&redis_url, &connections_topic).unwrap()
-                {
-                    let connection = Connection::from_str(connection.as_str()).unwrap();
-                    connections_map
-                        .entry(connection.publisher)
-                        .or_insert(HashSet::new())
-                        .insert(connection.subscriber);
-                }
-                info!(
-                    "Existing connection fan-out: {:?}",
-                    connections_map
-                        .iter()
-                        .map(|(k, v)| (k.to_string(), v.len()))
-                        .collect::<Vec<_>>()
-                );
-                if let Some(least_contented_publisher) = publishers
-                    .iter()
-                    .filter(|publisher| {
-                        connections_map
-                            .get(publisher)
-                            .map(|subscribers| subscribers.len())
-                            .unwrap_or(0)
-                            < 3
-                    })
-                    .min_by_key(|publisher| {
-                        connections_map
-                            .get(publisher)
-                            .map(|subscribers| subscribers.len())
-                            .unwrap_or(0)
-                    })
-                {
-                    let connection = format!("{}-{}", least_contented_publisher, my_gdp_name);
-                    info!(
-                        "Connecting to least-loaded publisher {} with connection {}",
-                        least_contented_publisher, connection
-                    );
-                    add_entity_to_database_as_transaction(
-                        &redis_url,
-                        &connections_topic,
-                        &connection,
-                    )
-                    .unwrap();
-                } else {
-                    let proxies = get_entity_from_database(&redis_url, &proxy_topic).unwrap()
-                        .iter()
-                        .map(|gdpname| GDPName::from_str(gdpname).unwrap())
-                        .collect::<Vec<_>>();
-
-                    let target_publisher = publishers.first().unwrap();
-
-                    if let Some(unused_proxy_gdp) = proxies.iter().filter(|proxy| !publishers.contains(proxy)).next() {
-                        info!(
-                            "No low-load publisher found; using proxy {} to reach {}",
-                            unused_proxy_gdp, target_publisher
-                        );
-                        add_entity_to_database_as_transaction(&redis_url, &publishers_topic, &unused_proxy_gdp.to_string()).unwrap();
-                        add_entity_to_database_as_transaction(&redis_url, &connections_topic, &format!("{}-{}", target_publisher, my_gdp_name)).unwrap();
-                        add_entity_to_database_as_transaction(&redis_url, &connections_topic, &format!("{}-{}", unused_proxy_gdp, my_gdp_name)).unwrap();
-                    } else {
-                        info!(
-                            "No proxy available to reach publisher {}; subscriber {} will retry later",
-                            target_publisher, my_gdp_name
-                        );
-                    }
-                }
             }
             "proxy" => {
                 add_entity_to_database_as_transaction(

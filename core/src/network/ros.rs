@@ -1,8 +1,12 @@
+use crate::db::get_redis_url;
 use crate::pipeline::construct_gdp_forward_from_bytes;
 use crate::structs::get_gdp_name_from_topic;
 use crate::structs::{GDPName, GDPPacket, GdpAction, Packet};
+use base64;
 use futures::stream::StreamExt;
 use log::info;
+use redis::Commands;
+use serde_json::json;
 
 #[cfg(feature = "ros")]
 use r2r::QosProfile;
@@ -11,11 +15,50 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task;
 
+// Best-effort Redis debug signal for message flow.
+#[cfg(feature = "ros")]
+fn fire_debug_signal(node: &GDPName, topic: &str, direction: &str, payload: &[u8]) {
+    let topic = topic.to_string();
+    let node_id = node.to_string();
+    let direction = direction.to_string();
+    let content = match std::str::from_utf8(payload) {
+        Ok(s) => s.to_string(),
+        Err(_) => base64::encode(payload),
+    };
+
+    tokio::spawn(async move {
+        let redis_url = get_redis_url();
+        let msg = json!({
+            "node": node_id,
+            "topic": topic,
+            "direction": direction,
+            "content": content,
+        })
+        .to_string();
+
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(client) = redis::Client::open(redis_url) {
+                if let Ok(mut conn) = client.get_connection() {
+                    let _: Result<(), _> = redis::cmd("PUBLISH")
+                        .arg("debug-messages")
+                        .arg(&msg)
+                        .query(&mut conn);
+                } else {
+                    info!("debug publish: failed to get redis connection");
+                }
+            } else {
+                info!("debug publish: failed to open redis client");
+            }
+        })
+        .await;
+    });
+}
+
 // Publishes messages to local ROS (receives from WebRTC)
 #[cfg(feature = "ros")]
 pub async fn network_to_ros_forwarder(
     node_name: String, topic_name: String, topic_type: String, certificate: Vec<u8>,
-    mut m_rx: UnboundedReceiver<GDPPacket>,
+    my_gdp_name: GDPName, mut m_rx: UnboundedReceiver<GDPPacket>,
 ) {
     let node_gdp_name = GDPName(get_gdp_name_from_topic(
         &node_name,
@@ -47,7 +90,9 @@ pub async fn network_to_ros_forwarder(
             info!("new payload to publish ");
             if pkt_to_forward.gdpname == topic_gdp_name {
                 let payload = pkt_to_forward.get_byte_payload().unwrap();
+                fire_debug_signal(&my_gdp_name, &topic_name, "network_receive", &payload);
                 publisher.publish(payload.clone()).unwrap();
+                fire_debug_signal(&my_gdp_name, &topic_name, "ros_publish", &payload);
             } else {
                 info!(
                     "{:?} received a packet for name {:?}",
@@ -93,9 +138,11 @@ pub async fn ros_to_network_forwarder(
     while let Some(packet) = subscriber.next().await {
         info!("received a packet {:?}", packet);
         let ros_msg = packet;
-        let packet = construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg);
+        fire_debug_signal(&node_gdp_name, &topic_name, "ros_receive", &ros_msg);
+        let packet = construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg.clone());
         if m_tx.send(packet).is_err() {
             break;
         }
+        fire_debug_signal(&node_gdp_name, &topic_name, "network_send", &ros_msg);
     }
 }

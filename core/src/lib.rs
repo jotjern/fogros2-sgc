@@ -14,6 +14,7 @@ pub mod pipeline;
 // util
 pub mod commands;
 pub mod topic_manager;
+pub mod routing;
 use utils::error::Result;
 
 pub mod gdp_proto {

@@ -110,6 +110,21 @@
       position: relative;
       overflow: hidden;
     }
+    .node-circle {
+      stroke: #fff;
+      stroke-width: 3;
+      transition: stroke 0.2s ease, stroke-width 0.2s ease;
+    }
+    .flash-send {
+      stroke: #ff6b6b !important;
+      stroke-width: 7 !important;
+      filter: drop-shadow(0 0 8px rgba(255, 107, 107, 0.7));
+    }
+    .flash-recv {
+      stroke: #4ecdc4 !important;
+      stroke-width: 7 !important;
+      filter: drop-shadow(0 0 8px rgba(78, 205, 196, 0.7));
+    }
 
     #graph {
       width: 100%;
@@ -210,8 +225,8 @@
   <div class="header">
     <h1>Redis Graph Visualizer</h1>
     <div class="controls">
-      <input type="text" id="host" placeholder="Redis Host" value="localhost">
-      <input type="text" id="port" placeholder="Redis Port" value="8002">
+      <input type="text" id="host" placeholder="Redis Host" value="rib">
+      <input type="text" id="port" placeholder="Redis Port" value="6379">
       <button class="btn-connect" id="connectBtn">Connect</button>
       <button class="btn-refresh" id="refreshBtn">Refresh</button>
       <span class="status disconnected" id="status">Disconnected</span>
@@ -319,22 +334,67 @@
       socket.emit('refresh');
     });
 
+    // Auto-connect on load
+    window.addEventListener('load', () => {
+      socket.emit('connect-redis', {
+        host: elements.host.value,
+        port: parseInt(elements.port.value) || 6379
+      });
+    });
+
     socket.on('redis-connected', () => {
       elements.status.textContent = 'Connected';
       elements.status.className = 'status connected';
       initGraph();
     });
 
+    const pendingFlashes = [];
+    socket.on('debug-event', (evt) => {
+      if (!evt || !evt.node) return;
+      console.log('debug-event', evt);
+      const nodeId = evt.node;
+      const dir = (evt.direction || '').toLowerCase();
+      const cls = dir.includes('send') || dir.includes('publish') ? 'flash-send' : 'flash-recv';
+      if (!highlightNode(nodeId, cls)) {
+        pendingFlashes.push({ nodeId, cls, ts: Date.now() });
+      }
+    });
+
     socket.on('redis-error', (message) => {
       showError(message);
       elements.status.textContent = 'Disconnected';
       elements.status.className = 'status disconnected';
+      scheduleReconnect();
+    });
+
+    socket.on('disconnect', () => {
+      elements.status.textContent = 'Disconnected';
+      elements.status.className = 'status disconnected';
+      scheduleReconnect();
     });
 
     socket.on('redis-data', (data) => {
       updateStats(data);
       processData(data);
       updateGraph();
+    });
+
+    let reconnectTimer = null;
+    function scheduleReconnect() {
+      if (reconnectTimer) return;
+      reconnectTimer = setInterval(() => {
+        socket.emit('connect-redis', {
+          host: elements.host.value,
+          port: parseInt(elements.port.value) || 6379
+        });
+      }, 2000);
+    }
+
+    socket.on('redis-connected', () => {
+      if (reconnectTimer) {
+        clearInterval(reconnectTimer);
+        reconnectTimer = null;
+      }
     });
 
     function showError(message) {
@@ -404,6 +464,28 @@
       });
 
       graphData = { nodes, links };
+      // Apply any pending flashes now that nodes exist
+      const now = Date.now();
+      const remaining = [];
+      pendingFlashes.forEach(f => {
+        if (now - f.ts < 5000) {
+          if (!highlightNode(f.nodeId, f.cls)) {
+            remaining.push(f);
+          }
+        }
+      });
+      pendingFlashes.length = 0;
+      pendingFlashes.push(...remaining);
+    }
+
+    function highlightNode(id, cls) {
+      const sel = d3.selectAll('circle').filter(d => d && d.id === id);
+      if (sel.empty()) {
+        return false;
+      }
+      sel.classed(cls, true);
+      setTimeout(() => sel.classed(cls, false), 800);
+      return true;
     }
 
     function computeLinkOffsets(links) {
@@ -523,8 +605,7 @@
       const nodeEnter = nodeSelection.enter()
         .append('circle')
         .attr('r', NODE_RADIUS)
-        .attr('stroke', '#fff')
-        .attr('stroke-width', 3)
+        .attr('class', 'node-circle')
         .style('cursor', 'grab')
         .call(d3.drag()
           .on('start', dragstarted)

@@ -216,7 +216,6 @@ pub async fn register_webrtc_stream(
                     match maybe_msg {
                         Some(Ok(m)) => {
                             info!("received {:?}", m);
-                            File::create("/tmp/iheard").unwrap();
                             if let Some(val) = match m {
                                 tungstenite::Message::Text(t) => {
                                     Some(serde_json::from_str::<serde_json::Value>(&t).unwrap())

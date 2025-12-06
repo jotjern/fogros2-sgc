@@ -2,6 +2,7 @@ use crate::pipeline::construct_gdp_forward_from_bytes;
 use crate::structs::get_gdp_name_from_topic;
 use crate::structs::{GDPName, GDPPacket, GdpAction, Packet};
 use futures::stream::StreamExt;
+use log::{error, info, warn};
 
 #[cfg(feature = "ros")]
 use r2r::QosProfile;
@@ -12,7 +13,7 @@ use tokio::task;
 
 // Publishes messages to local ROS (receives from WebRTC)
 #[cfg(feature = "ros")]
-pub async fn ros_publisher(
+pub async fn network_to_ros_forwarder(
     node_name: String, topic_name: String, topic_type: String, certificate: Vec<u8>,
     mut m_rx: UnboundedReceiver<GDPPacket>,
 ) {
@@ -59,7 +60,7 @@ pub async fn ros_publisher(
 
 // Subscribes to local ROS and sends to WebRTC
 #[cfg(feature = "ros")]
-pub async fn ros_subscriber(
+pub async fn ros_to_network_forwarder(
     node_name: String, topic_name: String, topic_type: String, certificate: Vec<u8>,
     m_tx: UnboundedSender<GDPPacket>,
 ) {
@@ -79,6 +80,7 @@ pub async fn ros_subscriber(
 
     let ctx = r2r::Context::create().expect("context creation failure");
     let mut node = r2r::Node::create(ctx, &node_name, "namespace").expect("node creation failure");
+    info!("Subscribing to {}", topic_name);
     let mut subscriber = node
         .subscribe_untyped(&topic_name, &topic_type, QosProfile::default())
         .expect("topic subscribing failure");
@@ -92,6 +94,8 @@ pub async fn ros_subscriber(
         info!("received a packet {:?}", packet);
         let ros_msg = packet;
         let packet = construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg);
-        let _ = m_tx.send(packet);
+        if m_tx.send(packet).is_err() {
+            break;
+        }
     }
 }

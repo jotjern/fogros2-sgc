@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::pipeline::construct_gdp_forward_from_bytes;
 use crate::structs::GDPHeaderInTransit;
@@ -17,7 +18,7 @@ use futures::{
 use tokio::sync::broadcast;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
+use log::{error, info, warn};
 use utils::app_config::AppConfig;
 
 // Buffer size for receiving WebRTC data chunks (1.7MB)
@@ -124,6 +125,7 @@ pub async fn register_webrtc_stream(
     my_id: &str,
     peer_to_dial: Option<String>,
 ) -> (DataStream, broadcast::Sender<()>) {
+    info!("IVE BEEN CALLED");
     // Own my_id so it can be moved into spawned tasks safely
     let my_id = my_id.to_string();
     let config = AppConfig::fetch().expect("Failed to fetch config");
@@ -232,21 +234,22 @@ pub async fn register_webrtc_stream(
     };
 
     tokio::spawn(f_read);
-    
+
     // Establish the data channel connection
     let stream = if peer_to_dial.is_some() {
         // We are the initiator: dial the peer
-        info!("dialing");
         let dc = listener.dial("whatever").await.unwrap();
         info!("dial succeed");
         dc
     } else {
         // We are the responder: accept incoming connection
+        tokio::time::sleep(Duration::from_millis(1000)).await;
         info!("accepting");
         let dc = listener.accept().await.unwrap();
         info!("accept succeed");
         dc
     };
+    info!("WE ARE SO BACK");
     (stream, shutdown_tx)
 }
 
@@ -272,6 +275,7 @@ pub async fn webrtc_reader_and_writer(
     mut rtc_rx: UnboundedReceiver<GDPPacket>, // Receive packets from ROS to forward
 ) {
     let thread_name: GDPName = generate_random_gdp_name();
+    let mut outbound_closed = false;
     
     // State for reassembling fragmented packets
     let mut need_more_data_for_previous_header = false;
@@ -361,7 +365,9 @@ pub async fn webrtc_reader_and_writer(
 
                     if deserialized.action == GdpAction::Forward {
                         let packet = construct_gdp_forward_from_bytes(deserialized.destination, thread_name, payload);
-                        ros_tx.send(packet).unwrap();
+                        if let Err(e) = ros_tx.send(packet) {
+                            warn!("ROS receiver dropped, discarding inbound packet: {}", e);
+                        }
                         // proc_gdp_packet(packet,  // packet
                         //     &fib_tx,  //used to send packet to fib
                         //     &channel_tx, // used to send GDPChannel to fib
@@ -393,9 +399,10 @@ pub async fn webrtc_reader_and_writer(
             // ========================================
             // SEND: ROS → WebRTC
             // ========================================
-            maybe_pkt_to_forward = rtc_rx.recv() => {
+            maybe_pkt_to_forward = rtc_rx.recv(), if !outbound_closed => {
                 let Some(pkt_to_forward) = maybe_pkt_to_forward else {
-                    break;
+                    outbound_closed = true;
+                    continue;
                 };
                 let transit_header = pkt_to_forward.get_header();
                 let mut header_string = serde_json::to_string(&transit_header).unwrap();

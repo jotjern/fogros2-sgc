@@ -2,8 +2,6 @@ extern crate tokio;
 extern crate tokio_core;
 
 use crate::topic_manager::ros_topic_discovery;
-use futures::future;
-
 use utils::app_config::AppConfig;
 use utils::error::Result;
 

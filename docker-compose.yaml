@@ -37,7 +37,7 @@ services:
           - rib 
           - signal
         environment:
-          SGC_CONFIG: "automatic-docker.toml"
+          SGC_CONFIG: "talker-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
         init: true
@@ -57,7 +57,7 @@ services:
           - rib
           - signal
         environment:
-          SGC_CONFIG: "automatic-docker.toml"
+          SGC_CONFIG: "listener-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
         # TODO: this is a hack to make sure the subscriber is started after the publisher
@@ -79,7 +79,7 @@ services:
           - rib
           - signal
         environment:
-          SGC_CONFIG: "automatic-docker.toml"
+          SGC_CONFIG: "proxy-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
         # TODO: this is a hack to make sure the subscriber is started after the publisher
@@ -87,5 +87,4 @@ services:
         init: true
         command: >
           bash -c "source /opt/ros/humble/setup.bash; 
-          ros2 run demo_nodes_py listener &
           /gdp-router router"

@@ -202,7 +202,7 @@ async fn handle(clients: ClientsMap, stream: TcpStream) {
                     println!("Client {} >> {}", &remote_id, &text);
                     remote.unbounded_send(Message::text(text)).unwrap();
                 }
-                _ => println!("Client {} not found", &remote_id),
+                None => eprintln!("ERROR: Client {} not found", &remote_id),
             }
         }
         future::ok(())

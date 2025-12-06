@@ -34,7 +34,6 @@ pub struct AppConfig {
     pub signaling_server_address: String,
     pub routing_information_base_address: String,
     pub automatic_topic_discovery: bool,
-    pub proxy: bool,
     pub ros: Vec<ROS>,
 }
 

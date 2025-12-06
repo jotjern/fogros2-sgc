@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Redis Graph Visualizer</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      min-height: 100vh;
+      color: #fff;
+    }
+
+    .header {
+      padding: 20px;
+      background: rgba(0, 0, 0, 0.3);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .header h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin-bottom: 15px;
+      color: #e94560;
+    }
+
+    .controls {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .controls input {
+      padding: 10px 15px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      font-size: 14px;
+      width: 150px;
+    }
+
+    .controls input::placeholder {
+      color: rgba(255, 255, 255, 0.5);
+    }
+
+    .controls button {
+      padding: 10px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-connect {
+      background: #e94560;
+      color: #fff;
+    }
+
+    .btn-connect:hover {
+      background: #ff6b6b;
+    }
+
+    .btn-refresh {
+      background: rgba(255, 255, 255, 0.1);
+      color: #fff;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .btn-refresh:hover {
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    .status {
+      padding: 8px 15px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .status.disconnected {
+      background: rgba(255, 107, 107, 0.2);
+      color: #ff6b6b;
+    }
+
+    .status.connected {
+      background: rgba(0, 255, 136, 0.2);
+      color: #00ff88;
+    }
+
+    .main-container {
+      display: flex;
+      height: calc(100vh - 100px);
+    }
+
+    .graph-container {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #graph {
+      width: 100%;
+      height: 100%;
+    }
+
+    .sidebar {
+      width: 280px;
+      background: rgba(0, 0, 0, 0.3);
+      border-left: 1px solid rgba(255, 255, 255, 0.1);
+      padding: 20px;
+      overflow-y: auto;
+    }
+
+    .sidebar h2 {
+      font-size: 0.9rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: rgba(255, 255, 255, 0.5);
+      margin-bottom: 15px;
+    }
+
+    .legend {
+      margin-bottom: 30px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    .legend-color {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+    }
+
+    .legend-color.node {
+      background: #4ecdc4;
+    }
+
+    .legend-color.proxy {
+      background: #ff6b6b;
+    }
+
+    .stats-item {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .stats-value {
+      font-weight: 600;
+      color: #e94560;
+    }
+
+    .error-toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      padding: 15px 20px;
+      background: #ff6b6b;
+      color: #fff;
+      border-radius: 8px;
+      font-size: 14px;
+      display: none;
+      max-width: 300px;
+      z-index: 1000;
+    }
+
+    .node-label {
+      font-size: 14px;
+      font-weight: 600;
+      fill: #fff;
+      text-anchor: middle;
+      dominant-baseline: middle;
+      pointer-events: none;
+    }
+
+    .edge-label {
+      font-size: 13px;
+      fill: rgba(255, 255, 255, 0.95);
+      text-anchor: middle;
+      pointer-events: none;
+      font-weight: 600;
+    }
+
+    .link {
+      fill: none;
+      stroke-width: 2.5;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Redis Graph Visualizer</h1>
+    <div class="controls">
+      <input type="text" id="host" placeholder="Redis Host" value="localhost">
+      <input type="text" id="port" placeholder="Redis Port" value="8002">
+      <button class="btn-connect" id="connectBtn">Connect</button>
+      <button class="btn-refresh" id="refreshBtn">Refresh</button>
+      <span class="status disconnected" id="status">Disconnected</span>
+    </div>
+  </div>
+
+  <div class="main-container">
+    <div class="graph-container">
+      <svg id="graph"></svg>
+    </div>
+
+    <div class="sidebar">
+      <div class="legend">
+        <h2>Legend</h2>
+        <div class="legend-item">
+          <div class="legend-color node"></div>
+          <span>Node</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-color proxy"></div>
+          <span>Proxy</span>
+        </div>
+      </div>
+
+      <div class="stats">
+        <h2>Statistics</h2>
+        <div class="stats-item">
+          <span>Nodes</span>
+          <span class="stats-value" id="nodeCount">0</span>
+        </div>
+        <div class="stats-item">
+          <span>Proxies</span>
+          <span class="stats-value" id="proxyCount">0</span>
+        </div>
+        <div class="stats-item">
+          <span>Connections</span>
+          <span class="stats-value" id="connectionCount">0</span>
+        </div>
+        <div class="stats-item">
+          <span>Topics</span>
+          <span class="stats-value" id="topicCount">0</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="error-toast" id="errorToast"></div>
+
+  <script>
+    const socket = io();
+
+    const NODE_RADIUS = 28;
+
+    const elements = {
+      host: document.getElementById('host'),
+      port: document.getElementById('port'),
+      connectBtn: document.getElementById('connectBtn'),
+      refreshBtn: document.getElementById('refreshBtn'),
+      status: document.getElementById('status'),
+      errorToast: document.getElementById('errorToast'),
+      nodeCount: document.getElementById('nodeCount'),
+      proxyCount: document.getElementById('proxyCount'),
+      connectionCount: document.getElementById('connectionCount'),
+      topicCount: document.getElementById('topicCount')
+    };
+
+    let simulation = null;
+    let graphData = { nodes: [], links: [] };
+    let svg, g, link, linkLabel, node, nodeLabel;
+    let width, height;
+
+    function initGraph() {
+      svg = d3.select('#graph');
+      const container = document.querySelector('.graph-container');
+      width = container.clientWidth;
+      height = container.clientHeight;
+
+      svg.attr('width', width).attr('height', height);
+      svg.selectAll('*').remove();
+
+      svg.append('defs');
+
+      g = svg.append('g');
+
+      const zoom = d3.zoom()
+        .scaleExtent([0.1, 4])
+        .on('zoom', (event) => g.attr('transform', event.transform));
+
+      svg.call(zoom);
+
+      g.append('g').attr('class', 'links');
+      g.append('g').attr('class', 'link-labels');
+      g.append('g').attr('class', 'nodes');
+      g.append('g').attr('class', 'node-labels');
+    }
+
+    elements.connectBtn.addEventListener('click', () => {
+      socket.emit('connect-redis', {
+        host: elements.host.value,
+        port: parseInt(elements.port.value) || 6379
+      });
+    });
+
+    elements.refreshBtn.addEventListener('click', () => {
+      socket.emit('refresh');
+    });
+
+    socket.on('redis-connected', () => {
+      elements.status.textContent = 'Connected';
+      elements.status.className = 'status connected';
+      initGraph();
+    });
+
+    socket.on('redis-error', (message) => {
+      showError(message);
+      elements.status.textContent = 'Disconnected';
+      elements.status.className = 'status disconnected';
+    });
+
+    socket.on('redis-data', (data) => {
+      updateStats(data);
+      processData(data);
+      updateGraph();
+    });
+
+    function showError(message) {
+      elements.errorToast.textContent = message;
+      elements.errorToast.style.display = 'block';
+      setTimeout(() => {
+        elements.errorToast.style.display = 'none';
+      }, 5000);
+    }
+
+    function updateStats(data) {
+      elements.nodeCount.textContent = data.nodes.length;
+      elements.proxyCount.textContent = data.proxies.length;
+      elements.connectionCount.textContent = data.connections.length;
+      elements.topicCount.textContent = data.topics.length;
+    }
+
+    function processData(data) {
+      const nodes = [];
+      const links = [];
+      const nodeSet = new Set();
+      const proxySet = new Set(data.proxies || []);
+      const publisherSet = new Set();
+
+      // First pass: identify publishers from connection sources
+      data.connections.forEach(conn => {
+        const parts = conn.split(',');
+        if (parts.length === 3 && parts[0]) {
+          publisherSet.add(parts[0]);
+        }
+      });
+
+      const addNode = (id) => {
+        if (nodeSet.has(id)) return;
+        const type = proxySet.has(id)
+          ? 'proxy'
+          : publisherSet.has(id)
+            ? 'publisher'
+            : 'other';
+        nodes.push({ id, type });
+        nodeSet.add(id);
+      };
+
+      (data.nodes || []).forEach(addNode);
+      (data.proxies || []).forEach(addNode);
+
+      data.connections.forEach(conn => {
+        const parts = conn.split(',');
+        if (parts.length === 3) {
+          const [source, topic, target] = parts;
+          addNode(source);
+          addNode(target);
+
+          links.push({ source, target, topic, id: `${source}-${target}-${topic}` });
+        }
+      });
+
+      const oldNodeMap = new Map(graphData.nodes.map(n => [n.id, n]));
+      nodes.forEach(n => {
+        const old = oldNodeMap.get(n.id);
+        if (old) {
+          n.x = old.x;
+          n.y = old.y;
+          n.vx = old.vx;
+          n.vy = old.vy;
+        }
+      });
+
+      graphData = { nodes, links };
+    }
+
+    function computeLinkOffsets(links) {
+      // Group all links by their node pair (undirected)
+      const pairMap = new Map();
+
+      links.forEach(link => {
+        const sourceId = link.source.id !== undefined ? link.source.id : link.source;
+        const targetId = link.target.id !== undefined ? link.target.id : link.target;
+
+        // Canonical key: sorted alphabetically
+        const [a, b] = [sourceId, targetId].sort();
+        const pairKey = `${a}||${b}`;
+
+        // Track if this link goes in canonical direction (a→b) or reverse (b→a)
+        // Canonical means source comes first alphabetically
+        if (sourceId === a) {
+          link.isCanonicalDirection = true;
+        } else {
+          link.isCanonicalDirection = false;
+        }
+
+        if (!pairMap.has(pairKey)) {
+          pairMap.set(pairKey, []);
+        }
+        pairMap.get(pairKey).push(link);
+      });
+
+      // For each pair, assign offsets
+      pairMap.forEach((group, pairKey) => {
+        const count = group.length;
+
+        // Sort the group so same-direction edges are together
+        group.sort((a, b) => {
+          const aSourceId = a.source.id !== undefined ? a.source.id : a.source;
+          const bSourceId = b.source.id !== undefined ? b.source.id : b.source;
+          if (aSourceId !== bSourceId) return aSourceId.localeCompare(bSourceId);
+          return a.topic.localeCompare(b.topic);
+        });
+
+        group.forEach((link, i) => {
+          link.offsetIndex = i;
+          link.offsetCount = count;
+        });
+      });
+    }
+
+    function updateGraph() {
+      if (!g) {
+        initGraph();
+      }
+
+      const topics = [...new Set(graphData.links.map(l => l.topic))];
+      const colorScale = d3.scaleOrdinal()
+        .domain(topics)
+        .range(d3.schemeSet2);
+
+      // Create arrow markers for each topic
+      const defs = svg.select('defs');
+      defs.selectAll('marker').remove();
+
+      topics.forEach(topic => {
+        const color = colorScale(topic);
+        const markerId = `arrow-${topic.replace(/[^a-zA-Z0-9]/g, '_')}`;
+        defs.append('marker')
+          .attr('id', markerId)
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 8)
+          .attr('refY', 0)
+          .attr('markerWidth', 6)
+          .attr('markerHeight', 6)
+          .attr('orient', 'auto')
+          .append('path')
+          .attr('d', 'M0,-4L8,0L0,4')
+          .attr('fill', color);
+      });
+
+      // Compute offsets for all links
+      computeLinkOffsets(graphData.links);
+
+      // Update links
+      const linkSelection = g.select('.links')
+        .selectAll('path')
+        .data(graphData.links, d => d.id);
+
+      linkSelection.exit().remove();
+
+      const linkEnter = linkSelection.enter()
+        .append('path')
+        .attr('class', 'link');
+
+      link = linkEnter.merge(linkSelection)
+        .attr('stroke', d => colorScale(d.topic))
+        .attr('marker-end', d => `url(#arrow-${d.topic.replace(/[^a-zA-Z0-9]/g, '_')})`);
+
+      // Update link labels
+      const linkLabelSelection = g.select('.link-labels')
+        .selectAll('text')
+        .data(graphData.links, d => d.id);
+
+      linkLabelSelection.exit().remove();
+
+      const linkLabelEnter = linkLabelSelection.enter()
+        .append('text')
+        .attr('class', 'edge-label');
+
+      linkLabel = linkLabelEnter.merge(linkLabelSelection)
+        .text(d => d.topic);
+
+      // Update nodes
+      const nodeSelection = g.select('.nodes')
+        .selectAll('circle')
+        .data(graphData.nodes, d => d.id);
+
+      nodeSelection.exit().remove();
+
+      const nodeEnter = nodeSelection.enter()
+        .append('circle')
+        .attr('r', NODE_RADIUS)
+        .attr('stroke', '#fff')
+        .attr('stroke-width', 3)
+        .style('cursor', 'grab')
+        .call(d3.drag()
+          .on('start', dragstarted)
+          .on('drag', dragged)
+          .on('end', dragended));
+
+      node = nodeEnter.merge(nodeSelection)
+        .attr('fill', d => {
+          if (d.type === 'proxy') return '#ff6b6b';
+          if (d.type === 'publisher') return '#4ecdc4';
+          return '#5c7cfa';
+        });
+
+      // Update node labels
+      const nodeLabelSelection = g.select('.node-labels')
+        .selectAll('text')
+        .data(graphData.nodes, d => d.id);
+
+      nodeLabelSelection.exit().remove();
+
+      const nodeLabelEnter = nodeLabelSelection.enter()
+        .append('text')
+        .attr('class', 'node-label');
+
+      nodeLabel = nodeLabelEnter.merge(nodeLabelSelection)
+        .text(d => d.id);
+
+      if (simulation) {
+        simulation.nodes(graphData.nodes);
+        simulation.force('link').links(graphData.links);
+        simulation.alpha(0.3).restart();
+      } else {
+        simulation = d3.forceSimulation(graphData.nodes)
+          .force('link', d3.forceLink(graphData.links).id(d => d.id).distance(180))
+          .force('charge', d3.forceManyBody().strength(-500))
+          .force('center', d3.forceCenter(width / 2, height / 2))
+          .force('collision', d3.forceCollide().radius(NODE_RADIUS + 20))
+          .force('bounds', boundingForce())
+          .on('tick', ticked);
+      }
+    }
+
+    function boundingForce() {
+      const padding = 60;
+      return function(alpha) {
+        graphData.nodes.forEach(node => {
+          if (node.x < padding) node.vx += (padding - node.x) * alpha * 0.5;
+          if (node.x > width - padding) node.vx += (width - padding - node.x) * alpha * 0.5;
+          if (node.y < padding) node.vy += (padding - node.y) * alpha * 0.5;
+          if (node.y > height - padding) node.vy += (height - padding - node.y) * alpha * 0.5;
+        });
+      };
+    }
+
+    function getEdgePath(d) {
+      const sourceX = d.source.x;
+      const sourceY = d.source.y;
+      const targetX = d.target.x;
+      const targetY = d.target.y;
+
+      const dx = targetX - sourceX;
+      const dy = targetY - sourceY;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+
+      if (dist === 0) return { path: `M${sourceX},${sourceY}L${targetX},${targetY}`, midX: sourceX, midY: sourceY };
+
+      // Unit vector from source to target
+      const ux = dx / dist;
+      const uy = dy / dist;
+
+      // Perpendicular vector (to the left of the direction)
+      const px = -uy;
+      const py = ux;
+
+      // Calculate offset
+      const spacing = 20;
+      const totalOffsets = d.offsetCount;
+      const offsetIndex = d.offsetIndex;
+
+      // Center the offsets around zero, but flip for reverse direction
+      let offset = (offsetIndex - (totalOffsets - 1) / 2) * spacing;
+      if (!d.isCanonicalDirection) {
+        offset = -offset;
+      }
+
+      // Calculate control point for quadratic curve (midpoint offset perpendicular)
+      const midX = (sourceX + targetX) / 2 + px * offset;
+      const midY = (sourceY + targetY) / 2 + py * offset;
+
+      // Shorten start and end to not overlap with nodes
+      // For a curved path, we need to find the point on the curve at distance NODE_RADIUS from the node centers
+
+      // Simplified: offset the start/end along the straight line, then curve
+      const startX = sourceX + ux * NODE_RADIUS;
+      const startY = sourceY + uy * NODE_RADIUS;
+      const endX = targetX - ux * (NODE_RADIUS + 8); // extra for arrow
+      const endY = targetY - uy * (NODE_RADIUS + 8);
+
+      // Adjust control point proportionally
+      const ctrlX = (startX + endX) / 2 + px * offset * 1.5;
+      const ctrlY = (startY + endY) / 2 + py * offset * 1.5;
+
+      // Label position (on the curve)
+      const labelX = ctrlX;
+      const labelY = ctrlY - 6;
+
+      return {
+        path: `M${startX},${startY}Q${ctrlX},${ctrlY} ${endX},${endY}`,
+        labelX: labelX,
+        labelY: labelY
+      };
+    }
+
+    function ticked() {
+      link.attr('d', d => getEdgePath(d).path);
+
+      linkLabel
+        .attr('x', d => getEdgePath(d).labelX)
+        .attr('y', d => getEdgePath(d).labelY);
+
+      node
+        .attr('cx', d => d.x)
+        .attr('cy', d => d.y);
+
+      nodeLabel
+        .attr('x', d => d.x)
+        .attr('y', d => d.y);
+    }
+
+    function dragstarted(event) {
+      if (!event.active) simulation.alphaTarget(0.3).restart();
+      event.subject.fx = event.subject.x;
+      event.subject.fy = event.subject.y;
+    }
+
+    function dragged(event) {
+      event.subject.fx = event.x;
+      event.subject.fy = event.y;
+    }
+
+    function dragended(event) {
+      if (!event.active) simulation.alphaTarget(0);
+      event.subject.fx = null;
+      event.subject.fy = null;
+    }
+
+    window.addEventListener('resize', () => {
+      const container = document.querySelector('.graph-container');
+      width = container.clientWidth;
+      height = container.clientHeight;
+      svg.attr('width', width).attr('height', height);
+
+      if (simulation) {
+        simulation.force('center', d3.forceCenter(width / 2, height / 2));
+        simulation.force('bounds', boundingForce());
+        simulation.alpha(0.1).restart();
+      }
+    });
+
+    initGraph();
+  </script>
+</body>
+</html>

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,6 +160,7 @@ pub async fn register_webrtc_stream(
     let mut shutdown_rx_w = shutdown_rx.resubscribe();
     let my_id_write = my_id.clone();
     let f_write = async move {
+        let mut pending: VecDeque<Message> = VecDeque::new();
         loop {
             tokio::select! {
                 _ = shutdown_rx_w.recv() => {
@@ -166,21 +168,32 @@ pub async fn register_webrtc_stream(
                     break;
                 }
                 Some(m) = rx_sig_outbound.next() => {
-                    let m = SignalingMessage {
-                        payload: m,
-                        id: other_peer_c.lock().as_ref().cloned().unwrap(),
-                    };
-                    let s = serde_json::to_string(&m).unwrap();
-                    info!("Sending {:?}", s);
-                    match write.send(tungstenite::Message::text(s)).await {
-                        Ok(_) => (),
-                        Err(e) => {
-                            error!("Error sending {:?}", e);
-                            break;
-                        }
-                    }
+                    pending.push_back(m);
                 }
                 else => break,
+            }
+            // Only send when we know the remote peer id.
+            if pending.is_empty() {
+                continue;
+            }
+            let Some(peer_id) = other_peer_c.lock().as_ref().cloned() else {
+                warn!("Signaling peer id unknown; buffering {} messages", pending.len());
+                continue;
+            };
+            while let Some(msg) = pending.pop_front() {
+                let m = SignalingMessage {
+                    payload: msg,
+                    id: peer_id.clone(),
+                };
+                let s = serde_json::to_string(&m).unwrap();
+                info!("Sending {:?}", s);
+                match write.send(tungstenite::Message::text(s)).await {
+                    Ok(_) => (),
+                    Err(e) => {
+                        error!("Error sending {:?}", e);
+                        break;
+                    }
+                }
             }
         }
         anyhow::Result::<_, anyhow::Error>::Ok(())

@@ -3,28 +3,21 @@ use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
 use crate::structs::{generate_random_gdp_name, get_gdp_name_from_topic, Connection, GDPName};
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use tokio::sync::{
-    broadcast,
-    mpsc::unbounded_channel,
-};
+use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio::time::Duration;
 use utils::app_config::AppConfig;
 
 use crate::db::*;
 
-
 async fn handle_new_connection(
     connection: Connection, topic_name: &str, topic_type: &str, certificate: &Vec<u8>,
     my_gdp_name: GDPName, topic_gdp: GDPName,
 ) -> Option<(String, broadcast::Sender<()>)> {
-    info!(
-        "New connection in {} (gdp {}): {}",
-        topic_name,
-        topic_gdp,
-        connection.to_string()
-    );
+
+
+    let connection_id = connection.to_string();
 
     if connection.publisher != my_gdp_name && connection.subscriber != my_gdp_name {
         info!(
@@ -33,6 +26,13 @@ async fn handle_new_connection(
         );
         return None;
     }
+
+    info!(
+        "New connection in {} (gdp {}): {}",
+        topic_name,
+        topic_gdp,
+        connection_id
+    );
 
     let publisher_signal_id = format!(
         "{}-{}-{}",
@@ -54,38 +54,57 @@ async fn handle_new_connection(
         Some(publisher_signal_id)
     };
 
-    let (webrtc_stream, webrtc_shutdown) =
-        register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
+    // Expose shutdown immediately; set up WebRTC and ROS bridging in the background.
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
+    let shutdown_tx_for_task = shutdown_tx.clone();
+    let topic_name_owned = topic_name.to_owned();
+    let topic_type_owned = topic_type.to_owned();
+    let certificate_owned = certificate.clone();
+    let my_signal_id_owned = my_signal_id.clone();
+    let is_publisher = connection.publisher == my_gdp_name;
 
-    println!("WebRTC connected!");
+    tokio::spawn(async move {
+        let (webrtc_stream, webrtc_shutdown) =
+            register_webrtc_stream(&my_signal_id_owned, signal_id_to_dial).await;
 
-    let (ros_tx, ros_rx) = unbounded_channel();
-    let (rtc_tx, rtc_rx) = unbounded_channel();
+        println!("WebRTC connected!");
 
-    let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
+        let (ros_tx, ros_rx) = unbounded_channel();
+        let (rtc_tx, rtc_rx) = unbounded_channel();
 
-    tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
-    if connection.publisher == my_gdp_name {
-        info!("Spawning ros to network forwarder");
-        tokio::spawn(ros_to_network_forwarder(
-            node_name,
-            topic_name.to_owned(),
-            topic_type.to_owned(),
-            certificate.clone(),
-            rtc_tx,
-        ));
-    } else {
-        info!("Spawning network to ros forwarder");
-        tokio::spawn(network_to_ros_forwarder(
-            node_name,
-            topic_name.to_owned(),
-            topic_type.to_owned(),
-            certificate.clone(),
-            ros_rx,
-        ));
-    }
+        let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
 
-    Some((connection.to_string(), webrtc_shutdown))
+        // Forward external shutdown to internal signaling tasks.
+        let mut external_shutdown = shutdown_tx_for_task.subscribe();
+        let webrtc_shutdown_clone = webrtc_shutdown.clone();
+        tokio::spawn(async move {
+            let _ = external_shutdown.recv().await;
+            let _ = webrtc_shutdown_clone.send(());
+        });
+
+        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
+        if is_publisher {
+            info!("Spawning ros to network forwarder");
+            tokio::spawn(ros_to_network_forwarder(
+                node_name,
+                topic_name_owned,
+                topic_type_owned,
+                certificate_owned,
+                rtc_tx,
+            ));
+        } else {
+            info!("Spawning network to ros forwarder");
+            tokio::spawn(network_to_ros_forwarder(
+                node_name,
+                topic_name_owned,
+                topic_type_owned,
+                certificate_owned,
+                ros_rx,
+            ));
+        }
+    });
+
+    Some((connection_id, shutdown_tx))
 }
 
 // This node receives from remote and publishes to local ROS
@@ -114,6 +133,7 @@ async fn create_topic_network_bridge(
     while let Some(event) = connection_changes.recv().await {
         match event {
             RedisListChange::Added(connection) => {
+                info!("NEW CONNECTION: {}", connection);
                 let parsed = match Connection::from_str(connection.as_str()) {
                     Ok(c) => c,
                     Err(e) => {
@@ -126,24 +146,23 @@ async fn create_topic_network_bridge(
                 let topic_type_cloned = topic_type.clone();
                 let certificate_cloned = certificate.clone();
 
-                match tokio::spawn(async move {
-                    handle_new_connection(
-                        parsed,
-                        &topic_name_cloned,
-                        &topic_type_cloned,
-                        &certificate_cloned,
-                        my_gdp_name,
-                        topic_gdp,
-                    )
-                    .await
-                })
+                match handle_new_connection(
+                    parsed,
+                    &topic_name_cloned,
+                    &topic_type_cloned,
+                    &certificate_cloned,
+                    my_gdp_name,
+                    topic_gdp,
+                )
                 .await
                 {
-                    Ok(Some((id, shutdown_sender))) => {
+                    Some((id, shutdown_sender)) => {
                         connections.insert(id, shutdown_sender);
+                        println!("WE THE BEST MUSIC");
                     }
-                    Ok(None) => {}
-                    Err(e) => error!("Failed to spawn connection handler: {:?}", e),
+                    None => {
+                        println!("We the worst music!");
+                    }
                 }
             }
             RedisListChange::Removed(connection) => {
@@ -188,19 +207,62 @@ pub async fn ros_topic_discovery() {
         ));
 
         let redis_url = get_redis_url();
-        let topic_gdp = GDPName(get_gdp_name_from_topic(&topic.topic_name, &topic.topic_type, &certificate));
+        let topic_gdp = GDPName(get_gdp_name_from_topic(
+            &topic.topic_name,
+            &topic.topic_type,
+            &certificate,
+        ));
         let publishers_topic = format!("{}-publishers", topic_gdp);
+        let connections_topic = format!("{}-connections", topic_gdp);
 
         match topic.action.as_str() {
             "pub" => {
-                add_entity_to_database_as_transaction(&redis_url, &publishers_topic, &my_gdp_name.to_string()).unwrap();
-            },
+                add_entity_to_database_as_transaction(
+                    &redis_url,
+                    &publishers_topic,
+                    &my_gdp_name.to_string(),
+                )
+                .unwrap();
+                info!("ADDING MYSELF TO PUBLISHERS!");
+            }
             "sub" => {
-                println!("TODO!");
-            },
-            "proxy" => {},
+                tokio::time::sleep(Duration::from_millis(5000)).await;
+                let publishers = get_entity_from_database(&redis_url, &publishers_topic)
+                    .unwrap()
+                    .iter()
+                    .map(|gdp_name_string| GDPName::from_str(gdp_name_string).unwrap())
+                    .collect::<Vec<_>>();
+
+                let mut connections_map = HashMap::new();
+                for connection in get_entity_from_database(&redis_url, &connections_topic).unwrap()
+                {
+                    let connection = Connection::from_str(connection.as_str()).unwrap();
+                    connections_map
+                        .entry(connection.publisher)
+                        .or_insert(HashSet::new())
+                        .insert(connection.subscriber);
+                }
+                if let Some(least_contented_publisher) = publishers.iter().max_by_key(|publisher| {
+                    connections_map
+                        .get(publisher)
+                        .map(|subscribers| subscribers.len())
+                        .unwrap_or(0)
+                }) {
+                    let connection = format!("{}-{}", least_contented_publisher, my_gdp_name);
+                    println!("Creating connection like this: {}", connection);
+                    add_entity_to_database_as_transaction(
+                        &redis_url,
+                        &connections_topic,
+                        &connection,
+                    )
+                    .unwrap();
+
+                    info!("PUBLISHERS: {:?}", publishers);
+                }
+            }
+            "proxy" => {}
             "noop" => {}
-            action => panic!("Unknown for topic {} action: {}", topic.topic_name, action)
+            action => panic!("Unknown for topic {} action: {}", topic.topic_name, action),
         };
     }
 

@@ -56,6 +56,7 @@ services:
         depends_on:
           - rib
           - signal
+          - talker
         environment:
           SGC_CONFIG: "listener-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"

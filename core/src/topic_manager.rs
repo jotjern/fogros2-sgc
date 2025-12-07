@@ -1,9 +1,9 @@
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
 use crate::routing::attach_subscriber;
-use crate::structs::{Connection, GDPName, gdp_name_to_string, generate_random_gdp_name, get_gdp_name_from_topic};
+use crate::structs::{Connection, GDPName, generate_random_gdp_name, get_gdp_name_from_topic};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::str::FromStr;
 use rand::Rng;
 use tokio::sync::{broadcast, mpsc::unbounded_channel};

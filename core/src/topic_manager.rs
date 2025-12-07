@@ -65,10 +65,9 @@ async fn establish_connection(
 
     // Spawn connection setup in background
     tokio::spawn(async move {
-        let (webrtc_stream, webrtc_shutdown) =
-            register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
-
-        info!("WebRTC stream established for signal_id: {}", my_signal_id);
+        info!("[Connection] Starting WebRTC setup for signal_id: {}", my_signal_id);
+        let (webrtc_stream, webrtc_shutdown) = register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
+        info!("[Connection] WebRTC stream established successfully for signal_id: {}", my_signal_id);
 
         let (ros_tx, ros_rx) = unbounded_channel();
         let (rtc_tx, rtc_rx) = unbounded_channel();
@@ -82,21 +81,24 @@ async fn establish_connection(
             let _ = webrtc_shutdown_clone.send(());
         });
 
+        info!("[Connection] Spawning WebRTC reader/writer for signal_id: {}", my_signal_id);
         tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
         
         if is_publisher {
-            info!("Spawning ros to network forwarder");
+            info!("[Connection] Spawning ROS to network forwarder for signal_id: {}", my_signal_id);
             tokio::spawn(ros_to_network_forwarder(
                 node_name, topic_name_owned, topic_type_owned,
                 certificate_owned, rtc_tx,
             ));
         } else {
-            info!("Spawning network to ros forwarder");
+            info!("[Connection] Spawning network to ROS forwarder for signal_id: {}", my_signal_id);
             tokio::spawn(network_to_ros_forwarder(
                 node_name, topic_name_owned, topic_type_owned,
                 certificate_owned, my_gdp_name, ros_rx,
             ));
         }
+        
+        info!("[Connection] All tasks spawned successfully for signal_id: {}", my_signal_id);
     });
 
     shutdown_tx
@@ -281,6 +283,14 @@ pub async fn ros_topic_discovery() {
     info!("My GDP name is: {}", my_gdp_name.to_string());
 
     let redis_url = get_redis_url();
+    
+    // Publish GDP name -> Docker container name mapping
+    let container_name = crate::db::get_container_name();
+    if let Err(e) = crate::db::publish_gdp_name_mapping(&redis_url, my_gdp_name, &container_name) {
+        error!("Failed to publish GDP name mapping: {}", e);
+    } else {
+        info!("Published GDP name mapping: {} -> {}", my_gdp_name.to_string(), container_name);
+    }
 
     // Setup each topic: spawn watcher and register role
     for topic in config.ros {

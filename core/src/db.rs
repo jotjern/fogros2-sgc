@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt;
 use redis::{self, transaction, Client, Commands, RedisResult};
@@ -198,6 +198,59 @@ pub fn register_publisher(
         .map_err(|e| format!("Failed to register as publisher: {}", e))?;
     info!("Registered as publisher for topic: {} (GDP: {})", topic_name, topic_gdp);
     Ok(())
+}
+
+/// Get Docker container name from environment (HOSTNAME) or default to "unknown".
+pub fn get_container_name() -> String {
+    std::env::var("HOSTNAME")
+        .unwrap_or_else(|_| {
+            // Try alternative environment variables
+            std::env::var("CONTAINER_NAME")
+                .unwrap_or_else(|_| "unknown".to_string())
+        })
+}
+
+/// Publish GDP name -> Docker container name mapping to Redis.
+/// Uses a hash map structure for efficient lookups.
+pub fn publish_gdp_name_mapping(
+    redis_url: &str,
+    gdp_name: crate::structs::GDPName,
+    container_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mapping_key = format!("gdp-name-mapping:{}", gdp_name.to_string());
+    add_entity_to_database_as_transaction(redis_url, &mapping_key, container_name)
+        .map_err(|e| format!("Failed to publish GDP name mapping: {}", e))?;
+    info!("Published GDP name mapping: {} -> {}", gdp_name.to_string(), container_name);
+    Ok(())
+}
+
+/// Get container name for a specific GDP name.
+pub fn get_container_name_for_gdp(redis_url: &str, gdp_name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mapping_key = format!("gdp-name-mapping:{}", gdp_name);
+    let mappings = get_entity_from_database(redis_url, &mapping_key)?;
+    Ok(mappings.first().cloned())
+}
+
+/// Get all GDP name -> container name mappings from Redis.
+pub fn get_gdp_name_mappings(redis_url: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let client = Client::open(redis_url)?;
+    let mut con = client.get_connection()?;
+    
+    // Get all keys matching the pattern
+    let pattern = "gdp-name-mapping:*";
+    let keys: Vec<String> = con.keys(pattern)?;
+    
+    let mut result = HashMap::new();
+    for key in keys {
+        // Extract GDP name from key (format: "gdp-name-mapping:XXXX")
+        if let Some(gdp_name) = key.strip_prefix("gdp-name-mapping:") {
+            let container_names: Vec<String> = con.lrange(&key, 0, -1)?;
+            if let Some(container_name) = container_names.first() {
+                result.insert(gdp_name.to_string(), container_name.clone());
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Register a GDP name as a proxy for a topic in Redis and connect it to the tree.

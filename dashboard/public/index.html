@@ -418,6 +418,7 @@
       const nodeSet = new Set();
       const proxySet = new Set(data.proxies || []);
       const publisherSet = new Set();
+      const gdpMappings = data.gdpMappings || {};
 
       // First pass: identify publishers from connection sources
       data.connections.forEach(conn => {
@@ -434,7 +435,8 @@
           : publisherSet.has(id)
             ? 'publisher'
             : 'other';
-        nodes.push({ id, type });
+        const containerName = gdpMappings[id] || null;
+        nodes.push({ id, type, containerName });
         nodeSet.add(id);
       };
 
@@ -631,7 +633,13 @@
         .attr('class', 'node-label');
 
       nodeLabel = nodeLabelEnter.merge(nodeLabelSelection)
-        .text(d => d.id);
+        .text(d => {
+          // Show container name if available, otherwise GDP name
+          if (d.containerName && d.containerName !== 'unknown') {
+            return `${d.containerName}\n(${d.id})`;
+          }
+          return d.id;
+        });
 
       if (simulation) {
         simulation.nodes(graphData.nodes);

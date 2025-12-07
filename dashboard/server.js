@@ -133,11 +133,23 @@ io.on('connection', (socket) => {
         topicPublishers.forEach((p) => nodesSet.add(p));
       }
 
+      // Fetch GDP name -> container name mappings
+      const mappingKeys = await redis.keys('gdp-name-mapping:*');
+      const gdpMappings = {};
+      for (const key of mappingKeys) {
+        const gdpName = key.replace('gdp-name-mapping:', '');
+        const containerNames = await redis.lrange(key, 0, -1);
+        if (containerNames.length > 0) {
+          gdpMappings[gdpName] = containerNames[0]; // Use first entry
+        }
+      }
+
       socket.emit('redis-data', {
         nodes: Array.from(nodesSet),
         proxies: Array.from(proxySet),
         connections,
-        topics
+        topics,
+        gdpMappings
       });
     } catch (err) {
       socket.emit('redis-error', err.message);

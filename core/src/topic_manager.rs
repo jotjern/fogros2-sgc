@@ -189,9 +189,9 @@ async fn manage_topic_connections(
 
 /// Attach this node as a subscriber with a random delay to avoid thundering herd.
 async fn attach_as_subscriber(
-    redis_url: &str,
+    redis_url: String,
     topic_gdp: GDPName,
-    topic_name: &str,
+    topic_name: String,
     my_gdp_name: GDPName,
 ) {
     // Random delay to avoid thundering herd problem
@@ -201,11 +201,11 @@ async fn attach_as_subscriber(
     
     let (publishers_key, connections_key, proxy_key) = topic_redis_keys(topic_gdp);
     if !attach_subscriber(
-        redis_url,
+        &redis_url,
         &connections_key,
         &publishers_key,
         &proxy_key,
-        topic_name,
+        &topic_name,
         my_gdp_name,
     ) {
         error!("Failed to attach as subscriber for topic {}", topic_name);
@@ -237,7 +237,7 @@ fn setup_topic(
         }
         "sub" => {
             tokio::spawn(attach_as_subscriber(
-                &redis_url, topic_gdp, &topic_name, my_gdp_name,
+                redis_url.clone(), topic_gdp, topic_name.clone(), my_gdp_name,
             ));
         }
         "proxy" => {

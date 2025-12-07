@@ -121,39 +121,8 @@ fn create_connection(
     Ok(())
 }
 
-/// Move subscribers from a parent to a proxy.
-/// Only moves subscribers, not proxies.
-fn move_subscribers_to_proxy(
-    redis_url: &str,
-    connections_key: &str,
-    parent: GDPName,
-    proxy: GDPName,
-    proxies: &[GDPName],
-    connections: &HashMap<GDPName, HashSet<GDPName>>,
-) -> Result<usize, String> {
-    let children = connections.get(&parent).cloned().unwrap_or_default();
-    let subscribers: Vec<GDPName> = children.iter()
-        .filter(|&&child| !proxies.contains(&child))
-        .copied()
-        .collect();
-    
-    if subscribers.is_empty() {
-        return Ok(0);
-    }
-    
-    for subscriber in &subscribers {
-        let old_conn = format!("{}-{}", parent, subscriber);
-        remove_entity_from_database_as_transaction(redis_url, connections_key, &old_conn)
-            .map_err(|e| format!("Failed to remove connection {}: {}", old_conn, e))?;
-        create_connection(redis_url, connections_key, proxy, *subscriber)?;
-    }
-    
-    Ok(subscribers.len())
-}
-
 /// Connect a proxy to the tree by finding best upstream node.
-/// Only connects if the proxy is actually needed (upstream is at capacity).
-/// Returns true if connection was created, false if already connected or not needed.
+/// Returns true if connection was created, false if already connected or no upstream available.
 pub fn connect_proxy_to_tree(
     redis_url: &str,
     connections_key: &str,
@@ -164,14 +133,13 @@ pub fn connect_proxy_to_tree(
 ) -> Result<bool, String> {
     let publishers = get_publishers(redis_url, publishers_key)?;
     let proxies = get_proxies(redis_url, proxies_key)?;
-    let mut connections = build_connections_map(redis_url, connections_key)?;
+    let connections = build_connections_map(redis_url, connections_key)?;
 
     // Check if already connected
     if node_depth(&proxy_name, &publishers, &connections).is_some() {
         return Ok(false);
     }
 
-    // Only connect proxy if there's an upstream at capacity that needs it
     // Find best upstream
     let upstream = match find_best_upstream(&publishers, &proxies, &connections, proxy_name) {
         Some(u) => u,
@@ -181,35 +149,9 @@ pub fn connect_proxy_to_tree(
         }
     };
 
-    // Only connect if upstream is at capacity
-    let upstream_load = child_count(&connections, &upstream);
-    if upstream_load < MAX_CHILDREN {
-        info!("Upstream {} not at capacity ({}/{}) for proxy {} (topic: {}); proxy not needed yet", 
-            upstream, upstream_load, MAX_CHILDREN, proxy_name, topic_name);
-        return Ok(false);
-    }
-
     create_connection(redis_url, connections_key, upstream, proxy_name)?;
     let node_type = if publishers.contains(&upstream) { "publisher" } else { "proxy" };
     info!("Connected proxy {} to {} {} (topic: {})", proxy_name, node_type, upstream, topic_name);
-    
-    // Reload connections after connecting
-    connections = build_connections_map(redis_url, connections_key)?;
-    
-    // Move subscribers from upstream to this proxy if upstream has mixed children
-    if has_mixed_children(&upstream, &proxies, &connections) {
-        match move_subscribers_to_proxy(redis_url, connections_key, upstream, proxy_name, &proxies, &connections) {
-            Ok(count) => {
-                if count > 0 {
-                    info!("Moved {} subscribers from {} to proxy {} (topic: {})", 
-                        count, upstream, proxy_name, topic_name);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to move subscribers to proxy {}: {}", proxy_name, e);
-            }
-        }
-    }
     
     Ok(true)
 }
@@ -293,37 +235,9 @@ pub fn attach_subscriber(
         }
     };
 
-    // Prefer attaching to an existing proxy child if parent has proxies as children
-    // This keeps subscribers organized under proxies
-    let parent_children = connections.get(&parent).cloned().unwrap_or_default();
-    let parent_proxy_children: Vec<GDPName> = parent_children.iter()
-        .filter(|&&child| proxies.contains(&child) && has_capacity(&connections, &child))
-        .copied()
-        .collect();
-    
-    if !parent_proxy_children.is_empty() {
-        // Find shallowest proxy child with capacity
-        let mut proxy_candidates = parent_proxy_children;
-        proxy_candidates.sort_by(|a, b| {
-            let depth_a = node_depth(a, &publishers, &connections).unwrap_or(usize::MAX);
-            let depth_b = node_depth(b, &publishers, &connections).unwrap_or(usize::MAX);
-            match depth_a.cmp(&depth_b) {
-                std::cmp::Ordering::Equal => {
-                    child_count(&connections, a).cmp(&child_count(&connections, b))
-                }
-                other => other,
-            }
-        });
-        
-        if let Some(proxy_parent) = proxy_candidates.first() {
-            info!("Attaching subscriber {} to existing proxy child {} of {} (topic: {})", 
-                subscriber_name, proxy_parent, parent, topic_name);
-            parent = *proxy_parent;
-        }
-    }
-
     // Only reorganize if parent is at capacity AND has mixed children
     // This ensures we only introduce proxies when necessary (at max children limit)
+    let parent_children = connections.get(&parent).cloned().unwrap_or_default();
     let parent_load = parent_children.len();
     
     if parent_load >= MAX_CHILDREN && has_mixed_children(&parent, &proxies, &connections) {

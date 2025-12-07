@@ -4,7 +4,7 @@ use crate::structs::get_gdp_name_from_topic;
 use crate::structs::{GDPName, GDPPacket, GdpAction, Packet};
 use base64;
 use futures::stream::StreamExt;
-use log::info;
+use log::{error, info, warn};
 use redis::Commands;
 use serde_json::json;
 
@@ -89,10 +89,16 @@ pub async fn network_to_ros_forwarder(
         if pkt_to_forward.action == GdpAction::Forward {
             info!("new payload to publish ");
             if pkt_to_forward.gdpname == topic_gdp_name {
-                let payload = pkt_to_forward.get_byte_payload().unwrap();
-                fire_debug_signal(&my_gdp_name, &topic_name, "network_receive", &payload);
-                publisher.publish(payload.clone()).unwrap();
-                fire_debug_signal(&my_gdp_name, &topic_name, "ros_publish", &payload);
+                if let Some(payload) = pkt_to_forward.get_byte_payload() {
+                    fire_debug_signal(&my_gdp_name, &topic_name, "network_receive", payload);
+                    if let Err(e) = publisher.publish(payload.clone()) {
+                        error!("Failed to publish to ROS topic {}: {:?}", topic_name, e);
+                    } else {
+                        fire_debug_signal(&my_gdp_name, &topic_name, "ros_publish", payload);
+                    }
+                } else {
+                    warn!("Received packet with no payload for topic {}", topic_name);
+                }
             } else {
                 info!(
                     "{:?} received a packet for name {:?}",

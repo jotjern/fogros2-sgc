@@ -24,7 +24,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/target \
-  . /opt/ros/humble/setup.sh && cargo chef cook --release --recipe-path recipe.json
+  . /opt/ros/humble/setup.sh && cargo chef cook --recipe-path recipe.json
 # to run with release mode, uncomment the following line
 # RUN . /opt/ros/humble/setup.sh cargo chef cook --release --recipe-path recipe.json
 
@@ -36,7 +36,7 @@ RUN mkdir /app/bins
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/target \
-    . /opt/ros/humble/setup.sh && cargo build --release && cp /app/target/release/gdp-router /app/bins/gdp-router
+    . /opt/ros/humble/setup.sh && cargo build && cp /app/target/debug/gdp-router /app/bins/gdp-router
 
 # Build the signaling crate in release mode
 RUN --mount=type=cache,target=/root/.cargo/registry \

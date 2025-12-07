@@ -266,22 +266,111 @@ async fn create_topic_network_bridge(
     }
 }
 
+/// Calculate topic GDP name from topic metadata.
+fn calculate_topic_gdp(topic_name: &str, topic_type: &str, certificate: &[u8]) -> GDPName {
+    GDPName(get_gdp_name_from_topic(topic_name, topic_type, certificate))
+}
+
+/// Generate Redis topic names for a given topic GDP.
+fn generate_redis_topic_names(topic_gdp: GDPName) -> (String, String, String) {
+    (
+        format!("{}-publishers", topic_gdp),
+        format!("{}-connections", topic_gdp),
+        format!("{}-proxies", topic_gdp),
+    )
+}
+
+/// Register this node as a publisher in Redis.
+fn register_as_publisher(
+    redis_url: &str,
+    publishers_topic: &str,
+    my_gdp_name: GDPName,
+    topic_name: &str,
+    topic_gdp: GDPName,
+) -> Result<(), Box<dyn std::error::Error>> {
+    add_entity_to_database_as_transaction(
+        redis_url,
+        publishers_topic,
+        &my_gdp_name.to_string(),
+    )
+    .map_err(|e| format!("Failed to register as publisher: {}", e))?;
+    info!("Registered as publisher for topic: {} (GDP: {})", topic_name, topic_gdp);
+    Ok(())
+}
+
+/// Register this node as a proxy in Redis.
+fn register_as_proxy(
+    redis_url: &str,
+    proxy_topic: &str,
+    my_gdp_name: GDPName,
+) -> Result<(), Box<dyn std::error::Error>> {
+    add_entity_to_database_as_transaction(redis_url, proxy_topic, &my_gdp_name.to_string())
+        .map_err(|e| format!("Failed to register as proxy: {}", e))?;
+    info!("Registered as proxy (GDP: {})", my_gdp_name);
+    Ok(())
+}
+
+/// Attach this node as a subscriber with a random delay to avoid thundering herd.
+async fn attach_as_subscriber(
+    redis_url: &str,
+    connections_topic: &str,
+    publishers_topic: &str,
+    proxy_topic: &str,
+    topic_name: &str,
+    my_gdp_name: GDPName,
+) {
+    // Random delay between 2-3 seconds to avoid thundering herd problem
+    let delay_ms = 2000 + (rand::thread_rng().gen::<u64>() % 1000);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    
+    if let Err(e) = attach_subscriber(
+        redis_url,
+        connections_topic,
+        publishers_topic,
+        proxy_topic,
+        topic_name,
+        my_gdp_name,
+    ) {
+        error!("Failed to attach as subscriber for topic {}: {:?}", topic_name, e);
+    }
+}
+
 pub async fn ros_topic_discovery() {
-    let config = AppConfig::fetch().unwrap();
+    let config = AppConfig::fetch().unwrap_or_else(|e| {
+        error!("Failed to fetch app config: {}", e);
+        std::process::exit(1);
+    });
 
     let certificate = std::fs::read(format!(
         "./scripts/crypto/{}/{}-private.pem",
         config.crypto_name, config.crypto_name
     ))
-    .expect("crypto file missing");
+    .unwrap_or_else(|e| {
+        error!(
+            "Failed to read certificate file for crypto_name '{}': {}",
+            config.crypto_name, e
+        );
+        std::process::exit(1);
+    });
 
-    let ctx = r2r::Context::create().unwrap();
-    let node = r2r::Node::create(ctx, "ros_manager", "namespace").unwrap();
+    let ctx = r2r::Context::create().unwrap_or_else(|e| {
+        error!("Failed to create ROS context: {}", e);
+        std::process::exit(1);
+    });
+    let _node = r2r::Node::create(ctx, "ros_manager", "namespace").unwrap_or_else(|e| {
+        error!("Failed to create ROS node: {}", e);
+        std::process::exit(1);
+    });
     let my_gdp_name = generate_random_gdp_name();
 
     info!("My GDP name is: {}", my_gdp_name.to_string());
 
+    let redis_url = get_redis_url();
+
     for topic in config.ros {
+        let topic_gdp = calculate_topic_gdp(&topic.topic_name, &topic.topic_type, &certificate);
+        
+        // Spawn bridge task for this topic
         tokio::spawn(create_topic_network_bridge(
             topic.topic_name.clone(),
             topic.topic_type.clone(),
@@ -289,48 +378,41 @@ pub async fn ros_topic_discovery() {
             my_gdp_name,
         ));
 
-        let redis_url = get_redis_url();
-        let topic_gdp = GDPName(get_gdp_name_from_topic(
-            &topic.topic_name,
-            &topic.topic_type,
-            &certificate,
-        ));
-        let publishers_topic = format!("{}-publishers", topic_gdp);
-        let connections_topic = format!("{}-connections", topic_gdp);
-        let proxy_topic = format!("{}-proxies", topic_gdp);
+        let (publishers_topic, connections_topic, proxy_topic) =
+            generate_redis_topic_names(topic_gdp);
 
         match topic.action.as_str() {
             "pub" => {
-                add_entity_to_database_as_transaction(
+                if let Err(e) = register_as_publisher(
                     &redis_url,
                     &publishers_topic,
-                    &my_gdp_name.to_string(),
-                )
-                .unwrap();
-                info!("Registered as publisher for topic: {} (GDP: {})", topic.topic_name, topic_gdp);
+                    my_gdp_name,
+                    &topic.topic_name,
+                    topic_gdp,
+                ) {
+                    error!("Error registering as publisher: {}", e);
+                }
             }
             "sub" => {
-                tokio::time::sleep(Duration::from_millis(2000 + (rand::thread_rng().gen::<u64>() % 1000))).await;
-                let _ = attach_subscriber(
+                tokio::spawn(attach_as_subscriber(
                     &redis_url,
                     &connections_topic,
                     &publishers_topic,
                     &proxy_topic,
                     &topic.topic_name,
                     my_gdp_name,
-                );
+                ));
             }
             "proxy" => {
-                add_entity_to_database_as_transaction(
-                    &redis_url,
-                    &proxy_topic,
-                    &my_gdp_name.to_string(),
-                )
-                .unwrap();
+                if let Err(e) = register_as_proxy(&redis_url, &proxy_topic, my_gdp_name) {
+                    error!("Error registering as proxy: {}", e);
+                }
             }
             "noop" => {}
-            action => panic!("Unknown for topic {} action: {}", topic.topic_name, action),
-        };
+            action => {
+                error!("Unknown action '{}' for topic {}", action, topic.topic_name);
+            }
+        }
     }
 
     loop {

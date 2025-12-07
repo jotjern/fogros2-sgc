@@ -525,7 +525,7 @@ pub async fn webrtc_reader_and_writer(
                 //insert the first null byte to separate the packet header
                 header_string.push(0u8 as char);
                 let header_string_payload = header_string.as_bytes();
-                match stream.write_all(&header_string_payload[..header_string_payload.len()).await {
+                match stream.write_all(header_string_payload).await {
                     Ok(_) => {
                         info!("[WebRTC] Successfully wrote header: {} bytes", header_string_payload.len());
                     }

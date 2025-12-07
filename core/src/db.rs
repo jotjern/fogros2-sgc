@@ -207,7 +207,9 @@ pub fn register_publisher(
 /// The container name is available via:
 /// 1. HOSTNAME environment variable (set by docker-compose to container name)
 /// 2. /etc/hostname file (contains the hostname/container name)
-/// 3. /proc/self/cgroup (contains container ID, but we want the name)
+/// 
+/// # Panics
+/// Panics if container name cannot be determined - this indicates a configuration issue.
 pub fn get_container_name() -> String {
     // First try CONTAINER_NAME if explicitly set (for manual overrides)
     if let Ok(name) = std::env::var("CONTAINER_NAME") {
@@ -233,10 +235,14 @@ pub fn get_container_name() -> String {
         }
     }
     
-    // Last resort: try to extract from /proc/self/cgroup
-    // This contains the container ID, but we can't easily map ID -> name without docker socket
-    // So we'll just return unknown
-    "unknown".to_string()
+    // Hard crash if container name cannot be determined
+    // This indicates a serious configuration issue that needs immediate attention
+    panic!(
+        "CRITICAL: Cannot determine container name! \
+        Checked CONTAINER_NAME env var, HOSTNAME env var, and /etc/hostname file. \
+        Container name is required for GDP name mapping. \
+        This is a configuration error that must be fixed."
+    );
 }
 
 /// Publish GDP name -> Docker container name mapping to Redis.

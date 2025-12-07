@@ -59,6 +59,7 @@ io.on('connection', (socket) => {
       await subscriber.psubscribe(`__keyspace@${dbIndex}__:*connections`);
       await subscriber.psubscribe(`__keyspace@${dbIndex}__:*publishers`);
       await subscriber.psubscribe(`__keyspace@${dbIndex}__:*proxies`);
+      await subscriber.psubscribe(`__keyspace@${dbIndex}__:*distress`);
 
       subscriber.on('pmessage', (pattern, channel, message) => {
         console.log(`Keyspace event: ${channel} -> ${message}`);
@@ -109,6 +110,7 @@ io.on('connection', (socket) => {
       const proxySet = new Set();
       const connections = [];
       const topics = [];
+      const distressedSet = new Set();
 
       for (const key of connectionKeys) {
         const topicId = key.replace(/-connections$/, '');
@@ -131,6 +133,12 @@ io.on('connection', (socket) => {
 
         const topicPublishers = await redis.lrange(`${topicId}-publishers`, 0, -1);
         topicPublishers.forEach((p) => nodesSet.add(p));
+
+        // Fetch distressed nodes for this topic
+        const distressedNodes = await redis.lrange(`${topicId}-distress`, 0, -1);
+        distressedNodes.forEach((node) => {
+          distressedSet.add(node);
+        });
       }
 
       // Fetch GDP name -> container name mappings
@@ -165,7 +173,8 @@ io.on('connection', (socket) => {
         connections,
         topics,
         gdpMappings,
-        unconnectedNodes
+        unconnectedNodes,
+        distressedNodes: Array.from(distressedSet)
       });
     } catch (err) {
       socket.emit('redis-error', err.message);

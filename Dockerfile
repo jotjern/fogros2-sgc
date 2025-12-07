@@ -44,6 +44,17 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/app/target \
     cd /app/signaling && cargo build --release && cp /app/target/release/sgc_signaling_server /app/bins/sgc_signaling_server
 
+# Stage for running fast, local simulations/tests (e.g., routing_sim) without full app runtime.
+FROM chef AS simtest
+WORKDIR /app
+COPY --from=planner /app/recipe.json recipe.json
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/target \
+    . /opt/ros/humble/setup.sh && cargo chef cook --recipe-path recipe.json
+COPY . .
+CMD [ "bash", "-lc", ". /opt/ros/humble/setup.bash && cargo test routing_sim -- --nocapture" ]
+
 FROM chef AS devcontainer
 WORKDIR /app
 

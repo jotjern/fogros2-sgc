@@ -478,6 +478,7 @@
       const publisherSet = new Set();
       const gdpMappings = data.gdpMappings || {};
       const unconnectedSet = new Set(data.unconnectedNodes || []);
+      const distressedSet = new Set(data.distressedNodes || []);
 
       // First pass: identify publishers from connection sources
       data.connections.forEach(conn => {
@@ -496,7 +497,8 @@
             : 'other';
         const containerName = gdpMappings[id] || null;
         const isUnconnected = unconnectedSet.has(id);
-        nodes.push({ id, type, containerName, isUnconnected });
+        const isDistressed = distressedSet.has(id);
+        nodes.push({ id, type, containerName, isUnconnected, isDistressed });
         nodeSet.add(id);
       };
 
@@ -677,11 +679,28 @@
       node = nodeEnter.merge(nodeSelection)
         .attr('fill', d => {
           if (d.isUnconnected) return '#ffaa00';
-          if (d.type === 'proxy') return '#ff6b6b';
+          if (d.type === 'proxy') {
+            // Distressed proxies are darker red
+            return d.isDistressed ? '#cc0000' : '#ff6b6b';
+          }
           if (d.type === 'publisher') return '#4ecdc4';
           return '#5c7cfa';
         })
-        .attr('opacity', d => d.isUnconnected ? 0.6 : 1.0);
+        .attr('opacity', d => d.isUnconnected ? 0.6 : 1.0)
+        .attr('stroke', d => {
+          // Add a red border for distressed proxies
+          if (d.type === 'proxy' && d.isDistressed) return '#ff0000';
+          return 'none';
+        })
+        .attr('stroke-width', d => {
+          if (d.type === 'proxy' && d.isDistressed) return 3;
+          return 0;
+        })
+        .attr('stroke-dasharray', d => {
+          // Add dashed border for distressed proxies to make them more visible
+          if (d.type === 'proxy' && d.isDistressed) return '5,3';
+          return 'none';
+        });
 
       // Update node labels
       const nodeLabelSelection = g.select('.node-labels')
@@ -702,11 +721,13 @@
       // Add container name if available
       nodeLabel.each(function(d) {
         const g = d3.select(this);
+        const distressIndicator = (d.type === 'proxy' && d.isDistressed) ? ' [DISTRESSED]' : '';
         if (d.containerName && d.containerName !== 'unknown') {
           g.append('text')
             .attr('class', 'node-label node-label-container')
             .attr('dy', '-4')
-            .text(d.containerName);
+            .style('fill', d.type === 'proxy' && d.isDistressed ? '#ff0000' : null)
+            .text(d.containerName + distressIndicator);
           g.append('text')
             .attr('class', 'node-label node-label-gdp')
             .attr('dy', '8')
@@ -714,7 +735,8 @@
         } else {
           g.append('text')
             .attr('class', 'node-label')
-            .text(d.id);
+            .style('fill', d.type === 'proxy' && d.isDistressed ? '#ff0000' : null)
+            .text(d.id + distressIndicator);
         }
       });
 

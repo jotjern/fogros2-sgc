@@ -272,7 +272,8 @@ pub fn get_gdp_name_mappings(redis_url: &str) -> Result<HashMap<String, String>,
     Ok(result)
 }
 
-/// Register a GDP name as a proxy for a topic in Redis and connect it to the tree.
+/// Register a GDP name as a proxy for a topic in Redis.
+/// Proxies advertise themselves but do not automatically connect to publishers.
 pub fn register_proxy(
     redis_url: &str,
     topic_gdp: crate::structs::GDPName,
@@ -280,35 +281,11 @@ pub fn register_proxy(
     topic_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy_key = format!("{}-proxies", topic_gdp);
-    let publishers_key = format!("{}-publishers", topic_gdp);
-    let connections_key = format!("{}-connections", topic_gdp);
     
     // Register proxy in Redis
     add_entity_to_database_as_transaction(redis_url, &proxy_key, &gdp_name.to_string())
         .map_err(|e| format!("Failed to register as proxy: {}", e))?;
-    info!("Registered as proxy (GDP: {})", gdp_name);
-    
-    // Connect proxy to tree (publisher or upstream proxy)
-    // This may fail if no upstream is available yet, but proxy is still registered
-    match crate::routing::connect_proxy_to_tree(
-        redis_url,
-        &connections_key,
-        &publishers_key,
-        &proxy_key,
-        topic_name,
-        gdp_name,
-    ) {
-        Ok(connected) => {
-            if connected {
-                info!("Proxy {} connected to tree during registration", gdp_name);
-            } else {
-                info!("Proxy {} registered but no upstream available yet; will connect when available", gdp_name);
-            }
-        }
-        Err(e) => {
-            error!("Failed to connect proxy {} to tree: {} (proxy still registered)", gdp_name, e);
-        }
-    }
+    info!("Registered as proxy (GDP: {}) for topic {}", gdp_name, topic_name);
     
     Ok(())
 }

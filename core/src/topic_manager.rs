@@ -2,7 +2,7 @@ use crate::connection_store::{connection_id, is_node_involved, parse_connection,
 use crate::db::{get_redis_url, register_proxy, register_publisher, RedisListChange};
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
-use crate::routing::attach_subscriber;
+use crate::routing::{attach_subscriber_to_publisher, handle_own_distress, make_proxy_publisher, update_own_distress_status};
 use crate::structs::{Connection, GDPName, generate_random_gdp_name, get_gdp_name_from_topic};
 
 use std::collections::HashMap;
@@ -109,6 +109,7 @@ async fn establish_connection(
 }
 
 /// Handle a new connection being added to Redis.
+/// Returns true if this node is the publisher in this connection.
 async fn handle_connection_added(
     connection_string: String,
     topic_name: &str,
@@ -117,10 +118,14 @@ async fn handle_connection_added(
     topic_gdp: GDPName,
     my_gdp_name: GDPName,
     connections: &mut HashMap<String, broadcast::Sender<()>>,
-) {
+    redis_url: &str,
+    is_publisher: bool,
+    is_proxy: bool,
+    local_publisher_connection_count: &mut usize,
+) -> bool {
     let connection = match parse_connection(&connection_string) {
         Some(c) => c,
-        None => return,
+        None => return false,
     };
 
     // Skip if this node is not involved
@@ -129,28 +134,49 @@ async fn handle_connection_added(
             "Skipping connection not involving this node: publisher {}, subscriber {}, me {}",
             connection.publisher, connection.subscriber, my_gdp_name
         );
-        return;
+        return false;
     }
 
     let conn_id = connection_id(topic_gdp, &connection);
     let shutdown_tx = establish_connection(
-        connection, topic_name, topic_type, certificate, my_gdp_name, topic_gdp,
+        connection.clone(), topic_name, topic_type, certificate, my_gdp_name, topic_gdp,
     ).await;
     
     connections.insert(conn_id.clone(), shutdown_tx);
     info!("Successfully established connection: {}", conn_id);
+    
+    // If this node is the publisher, increment local connection count
+    let is_this_node_publisher = connection.publisher == my_gdp_name;
+    if is_this_node_publisher && (is_publisher || is_proxy) {
+        *local_publisher_connection_count += 1;
+    }
+    
+    // If this node is a proxy and just connected to a publisher, make it a publisher too
+    if is_proxy && connection.subscriber == my_gdp_name {
+        if let Err(e) = make_proxy_publisher(redis_url, topic_gdp, topic_name, my_gdp_name) {
+            error!("Failed to make proxy {} a publisher: {}", my_gdp_name, e);
+        }
+    }
+    
+    is_this_node_publisher
 }
 
 /// Handle a connection being removed from Redis.
+/// Returns true if this node was the publisher in this connection.
 fn handle_connection_removed(
     connection_string: String,
     topic_gdp: GDPName,
     connections_topic: &str,
     connections: &mut HashMap<String, broadcast::Sender<()>>,
-) {
+    _redis_url: &str,
+    my_gdp_name: GDPName,
+    is_publisher: bool,
+    is_proxy: bool,
+    local_publisher_connection_count: &mut usize,
+) -> bool {
     let connection = match parse_connection(&connection_string) {
         Some(c) => c,
-        None => return,
+        None => return false,
     };
 
     let conn_id = connection_id(topic_gdp, &connection);
@@ -159,34 +185,75 @@ fn handle_connection_removed(
         info!("Shutdown signal sent for connection: {}", conn_id);
     }
     info!("Connection removed from {}: {}", connections_topic, connection_string);
+    
+    // If this node was the publisher, decrement local connection count
+    let is_this_node_publisher = connection.publisher == my_gdp_name;
+    if is_this_node_publisher && (is_publisher || is_proxy) && *local_publisher_connection_count > 0 {
+        *local_publisher_connection_count -= 1;
+    }
+    
+    is_this_node_publisher
 }
 
 /// Watch Redis for connection changes and manage connections for a topic.
 /// This is the main event loop that reacts to connection additions/removals.
 async fn manage_topic_connections(
     topic_name: String, topic_type: String, certificate: Vec<u8>, my_gdp_name: GDPName,
+    is_publisher: bool, is_proxy: bool,
 ) {
     let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
-    let (_, connections_key, _) = topic_redis_keys(topic_gdp);
+    let (_, connections_key, _, _) = topic_redis_keys(topic_gdp);
+    let redis_url = get_redis_url();
 
     info!("Managing connections for topic {} (GDP: {})", topic_name, topic_gdp);
 
     let mut connection_changes = watch_topic_connections(topic_gdp).await;
     let mut connections: HashMap<String, broadcast::Sender<()>> = HashMap::new();
+    
+    // Track local connection count for this node as a publisher
+    let mut local_publisher_connection_count = 0;
 
     while let Some(event) = connection_changes.recv().await {
         match event {
             RedisListChange::Added(connection_string) => {
                 info!("New connection detected: {}", connection_string);
-                handle_connection_added(
+                let was_publisher = handle_connection_added(
                     connection_string, &topic_name, &topic_type, &certificate,
-                    topic_gdp, my_gdp_name, &mut connections,
+                    topic_gdp, my_gdp_name, &mut connections, &redis_url,
+                    is_publisher, is_proxy, &mut local_publisher_connection_count,
                 ).await;
+                
+                // Update distress status if this node is the publisher
+                if was_publisher && (is_publisher || is_proxy) {
+                    if let Err(e) = update_own_distress_status(
+                        &redis_url,
+                        topic_gdp,
+                        my_gdp_name,
+                        local_publisher_connection_count,
+                        is_proxy,
+                    ) {
+                        error!("Failed to update own distress status: {}", e);
+                    }
+                }
             }
             RedisListChange::Removed(connection_string) => {
-                handle_connection_removed(
-                    connection_string, topic_gdp, &connections_key, &mut connections,
+                let was_publisher = handle_connection_removed(
+                    connection_string, topic_gdp, &connections_key, &mut connections, &redis_url,
+                    my_gdp_name, is_publisher, is_proxy, &mut local_publisher_connection_count,
                 );
+                
+                // Update distress status if this node is the publisher
+                if was_publisher && (is_publisher || is_proxy) {
+                    if let Err(e) = update_own_distress_status(
+                        &redis_url,
+                        topic_gdp,
+                        my_gdp_name,
+                        local_publisher_connection_count,
+                        is_proxy,
+                    ) {
+                        error!("Failed to update own distress status: {}", e);
+                    }
+                }
             }
         }
     }
@@ -205,8 +272,8 @@ async fn attach_as_subscriber(
         + (rand::thread_rng().gen::<u64>() % SUBSCRIBER_ATTACH_RANDOM_DELAY_MS);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     
-    let (publishers_key, connections_key, proxy_key) = topic_redis_keys(topic_gdp);
-    if !attach_subscriber(
+    let (publishers_key, connections_key, proxy_key, _) = topic_redis_keys(topic_gdp);
+    match attach_subscriber_to_publisher(
         &redis_url,
         &connections_key,
         &publishers_key,
@@ -214,7 +281,10 @@ async fn attach_as_subscriber(
         &topic_name,
         my_gdp_name,
     ) {
-        error!("Failed to attach as subscriber for topic {}", topic_name);
+        Ok(false) | Err(_) => {
+            error!("Failed to attach as subscriber for topic {}", topic_name);
+        }
+        Ok(true) => {}
     }
 }
 
@@ -229,9 +299,14 @@ fn setup_topic(
 ) {
     let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
     
+    // Determine if this node is a publisher or proxy
+    let is_publisher = topic_action == "pub";
+    let is_proxy = topic_action == "proxy";
+    
     // Always spawn connection manager to react to connection changes
     tokio::spawn(manage_topic_connections(
         topic_name.clone(), topic_type.clone(), certificate.clone(), my_gdp_name,
+        is_publisher, is_proxy,
     ));
 
     // Register role based on action
@@ -239,6 +314,11 @@ fn setup_topic(
         "pub" => {
             if let Err(e) = register_publisher(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as publisher: {}", e);
+            } else {
+                // Spawn distress handler for this publisher
+                let redis_url_for_distress = redis_url.clone();
+                let topic_name_for_distress = topic_name.clone();
+                tokio::spawn(handle_own_distress(redis_url_for_distress, topic_gdp, topic_name_for_distress, my_gdp_name));
             }
         }
         "sub" => {
@@ -249,6 +329,11 @@ fn setup_topic(
         "proxy" => {
             if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as proxy: {}", e);
+            } else {
+                // Spawn distress handler for this proxy (proxies can also be publishers)
+                let redis_url_for_distress = redis_url.clone();
+                let topic_name_for_distress = topic_name.clone();
+                tokio::spawn(handle_own_distress(redis_url_for_distress, topic_gdp, topic_name_for_distress, my_gdp_name));
             }
         }
         "noop" => {}

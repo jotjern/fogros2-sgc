@@ -64,7 +64,7 @@ impl From<u16be> for u16 {
 }
 
 // 4-byte (256 bit) unique identifier for topics/nodes, derived from hash(topic_name, topic_type, certificate)
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, Default)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Deserialize, Hash, Default)]
 pub struct GDPName(pub [u8; 4]);
 impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -255,6 +255,7 @@ pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
     format!("{:x}{:x}{:x}{:x}", name[0], name[1], name[2], name[3])
 }
 
+#[derive(Clone)]
 pub struct Connection {
   pub publisher: GDPName,
   pub subscriber: GDPName

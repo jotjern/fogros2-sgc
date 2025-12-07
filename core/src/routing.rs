@@ -1,355 +1,539 @@
-use crate::connection_store::{build_connections_map, get_proxies, get_publishers};
-use crate::db::{add_entity_to_database_as_transaction, remove_entity_from_database_as_transaction};
+use crate::connection_store::{
+    build_connections_map, get_distressed_nodes, get_proxies, get_publishers,
+};
+use crate::db::{
+    add_entity_to_database_as_transaction, remove_entity_from_database_as_transaction,
+    register_publisher,
+};
 use crate::structs::GDPName;
 use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 
-const MAX_CHILDREN: usize = 5;
+/*
+Routing model (simplified)
+--------------------------
+- Distress thresholds: publishers are distressed with >=3 direct children, proxies with >=5.
+- Leaf publisher: publisher with no publisher children.
+- Subscriber placement:
+    * Pick the non-distressed leaf with the fewest direct listeners (ties by GDPName).
+    * Never attach to a distressed publisher; if all leaves are distressed, attach a proxy to
+      the least-loaded distressed leaf (if available) and connect to that proxy. Otherwise retry.
+- Distress handling (run every second by each node):
+    * If distressed, move one listener to the least-loaded non-distressed proxy child.
+    * Otherwise, attach one available non-distressed proxy, promote it, and move one listener.
+    * Only one listener is moved per tick to limit churn.
+*/
 
-/// Get number of children for a node.
-fn child_count(connections: &HashMap<GDPName, HashSet<GDPName>>, node: &GDPName) -> usize {
-    connections.get(node).map(|children| children.len()).unwrap_or(0)
+#[derive(Clone, Debug)]
+struct LeafPublisherView {
+    publisher: GDPName,
+    listener_count: usize,
+    distressed: bool,
 }
 
-/// Check if node has capacity for more children.
-fn has_capacity(connections: &HashMap<GDPName, HashSet<GDPName>>, node: &GDPName) -> bool {
-    child_count(connections, node) < MAX_CHILDREN
-}
+// Distress thresholds
+const PUBLISHER_DISTRESS_THRESHOLD: usize = 3;
+const PROXY_DISTRESS_THRESHOLD: usize = 5;
 
-/// Find depth of node in tree (0 = publisher, 1+ = proxy/subscriber).
-/// Returns None if node is not connected to any publisher.
-fn node_depth(
-    node: &GDPName,
-    publishers: &[GDPName],
-    connections: &HashMap<GDPName, HashSet<GDPName>>,
-) -> Option<usize> {
-    if publishers.contains(node) {
-        return Some(0);
-    }
-
-    // BFS from publishers to find shortest path
-    let mut queue = std::collections::VecDeque::new();
-    let mut visited = HashSet::new();
-    let mut depths = HashMap::new();
-
-    for &pub_node in publishers {
-        queue.push_back(pub_node);
-        visited.insert(pub_node);
-        depths.insert(pub_node, 0);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current == *node {
-            return depths.get(&current).copied();
-        }
-
-        if let Some(children) = connections.get(&current) {
-            let current_depth = *depths.get(&current).unwrap();
-            for &child in children {
-                if !visited.contains(&child) {
-                    visited.insert(child);
-                    depths.insert(child, current_depth + 1);
-                    queue.push_back(child);
-                }
-            }
-        }
-    }
-
-    None
-}
-
-/// Check if a node has mixed children (both proxies and subscribers).
-fn has_mixed_children(
-    node: &GDPName,
-    proxies: &[GDPName],
-    connections: &HashMap<GDPName, HashSet<GDPName>>,
-) -> bool {
-    if let Some(children) = connections.get(node) {
-        let has_proxy = children.iter().any(|child| proxies.contains(child));
-        let has_subscriber = children.iter().any(|child| !proxies.contains(child));
-        has_proxy && has_subscriber
-    } else {
-        false
-    }
-}
-
-/// Find the best upstream node for a new node (shallowest with capacity).
-/// Prioritizes shallow nodes to keep tree depth minimal.
-fn find_best_upstream(
-    publishers: &[GDPName],
-    proxies: &[GDPName],
-    connections: &HashMap<GDPName, HashSet<GDPName>>,
-    exclude: GDPName,
-) -> Option<GDPName> {
-    // Collect all nodes with capacity
-    let mut candidates: Vec<GDPName> = publishers.iter()
-        .chain(proxies.iter())
-        .filter(|&&node| node != exclude && has_capacity(connections, &node))
-        .copied()
-        .collect();
-
-    if candidates.is_empty() {
-        return None;
-    }
-
-    // Sort by: 1) depth (shallowest first - strong priority), 2) load (least loaded first)
-    candidates.sort_by(|a, b| {
-        let depth_a = node_depth(a, publishers, connections).unwrap_or(usize::MAX);
-        let depth_b = node_depth(b, publishers, connections).unwrap_or(usize::MAX);
-        
-        match depth_a.cmp(&depth_b) {
-            std::cmp::Ordering::Equal => {
-                child_count(connections, a).cmp(&child_count(connections, b))
-            }
-            other => other,
-        }
-    });
-
-    candidates.first().copied()
-}
-
-/// Create a connection: parent -> child.
-fn create_connection(
+/// Add a node to the distress list
+fn add_to_distress(
     redis_url: &str,
-    connections_key: &str,
-    parent: GDPName,
-    child: GDPName,
+    distress_key: &str,
+    node: GDPName,
 ) -> Result<(), String> {
-    let connection = format!("{}-{}", parent, child);
-    add_entity_to_database_as_transaction(redis_url, connections_key, &connection)
-        .map_err(|e| format!("Failed to create connection: {}", e))?;
+    add_entity_to_database_as_transaction(redis_url, distress_key, &node.to_string())
+        .map_err(|e| format!("Failed to add node to distress list: {}", e))?;
+    info!("Marked node {} as distressed", node);
     Ok(())
 }
 
-/// Connect a proxy to the tree by finding best upstream node.
-/// Returns true if connection was created, false if already connected or no upstream available.
-pub fn connect_proxy_to_tree(
+/// Remove a node from the distress list
+fn remove_from_distress(
+    redis_url: &str,
+    distress_key: &str,
+    node: GDPName,
+) -> Result<(), String> {
+    remove_entity_from_database_as_transaction(redis_url, distress_key, &node.to_string())
+        .map_err(|e| format!("Failed to remove node from distress list: {}", e))?;
+    info!("Removed node {} from distress list", node);
+    Ok(())
+}
+
+/// Update distress status for this node based on local connection count.
+/// This should be called by publishers/proxies when their connection count changes.
+pub fn update_own_distress_status(
+    redis_url: &str,
+    topic_gdp: GDPName,
+    my_gdp_name: GDPName,
+    connection_count: usize,
+    is_proxy: bool,
+) -> Result<(), String> {
+    let (_, _, _, distress_key) = crate::connection_store::topic_redis_keys(topic_gdp);
+    
+    // Determine threshold
+    let threshold = if is_proxy {
+        PROXY_DISTRESS_THRESHOLD
+    } else {
+        PUBLISHER_DISTRESS_THRESHOLD
+    };
+    
+    // Check current distress status
+    let distressed = get_distressed_nodes(redis_url, &distress_key)
+        .unwrap_or_default();
+    let is_currently_distressed = distressed.contains(&my_gdp_name);
+    
+    // Update distress status based on local connection count
+    if connection_count >= threshold && !is_currently_distressed {
+        // Mark as distressed
+        add_to_distress(redis_url, &distress_key, my_gdp_name)?;
+    } else if connection_count < threshold && is_currently_distressed {
+        // Remove from distress
+        remove_from_distress(redis_url, &distress_key, my_gdp_name)?;
+    }
+    
+    Ok(())
+}
+
+/// Find leaf publishers (publishers with no publisher children) with listener counts and distress info.
+/// Listener count only includes direct listener children (not proxies, not publishers).
+fn collect_leaf_publishers(
     redis_url: &str,
     connections_key: &str,
     publishers_key: &str,
     proxies_key: &str,
-    topic_name: &str,
-    proxy_name: GDPName,
-) -> Result<bool, String> {
+    distress_key: &str,
+) -> Result<Vec<LeafPublisherView>, String> {
+    let connections_map = build_connections_map(redis_url, connections_key)?;
     let publishers = get_publishers(redis_url, publishers_key)?;
     let proxies = get_proxies(redis_url, proxies_key)?;
-    let connections = build_connections_map(redis_url, connections_key)?;
+    let distressed = get_distressed_nodes(redis_url, distress_key)?;
 
-    // Check if already connected
-    if node_depth(&proxy_name, &publishers, &connections).is_some() {
-        return Ok(false);
-    }
+    let publishers_set: HashSet<GDPName> = publishers.iter().copied().collect();
+    let proxies_set: HashSet<GDPName> = proxies.iter().copied().collect();
 
-    // Find best upstream
-    let upstream = match find_best_upstream(&publishers, &proxies, &connections, proxy_name) {
-        Some(u) => u,
-        None => {
-            info!("No upstream available for proxy {} (topic: {}); will connect when available", proxy_name, topic_name);
-            return Ok(false);
+    let mut leaf_publishers = Vec::new();
+
+    for publisher in publishers {
+        // Check if this publisher has any children that are also publishers
+        let has_publisher_children = connections_map
+            .get(&publisher)
+            .map(|subscribers| subscribers.iter().any(|&sub| publishers_set.contains(&sub)))
+            .unwrap_or(false);
+
+        // A leaf publisher has no children that are publishers
+        if !has_publisher_children {
+            // Count only direct listener children (not proxies, not publishers)
+            let listener_count = connections_map
+                .get(&publisher)
+                .map(|subscribers| {
+                    subscribers
+                        .iter()
+                        .filter(|&&sub| !proxies_set.contains(&sub) && !publishers_set.contains(&sub))
+                        .count()
+                })
+                .unwrap_or(0);
+
+            leaf_publishers.push(LeafPublisherView {
+                publisher,
+                listener_count,
+                distressed: distressed.contains(&publisher),
+            });
         }
-    };
-
-    create_connection(redis_url, connections_key, upstream, proxy_name)?;
-    let node_type = if publishers.contains(&upstream) { "publisher" } else { "proxy" };
-    info!("Connected proxy {} to {} {} (topic: {})", proxy_name, node_type, upstream, topic_name);
-    
-    Ok(true)
-}
-
-/// Ensure a node is connected to the tree (has path to publisher).
-/// Returns true if node is connected, false otherwise.
-fn ensure_node_connected(
-    node: &GDPName,
-    publishers: &[GDPName],
-    connections: &HashMap<GDPName, HashSet<GDPName>>,
-) -> bool {
-    node_depth(node, publishers, connections).is_some()
-}
-
-/// Move all children from one parent to another.
-fn move_children_to_new_parent(
-    redis_url: &str,
-    connections_key: &str,
-    old_parent: GDPName,
-    new_parent: GDPName,
-    children: &HashSet<GDPName>,
-) -> Result<(), String> {
-    // Remove old connections
-    for child in children {
-        let old_conn = format!("{}-{}", old_parent, child);
-        remove_entity_from_database_as_transaction(redis_url, connections_key, &old_conn)
-            .map_err(|e| format!("Failed to remove old connection {}: {}", old_conn, e))?;
     }
-    
-    // Create new connections
-    for child in children {
-        create_connection(redis_url, connections_key, new_parent, *child)?;
-    }
-    
-    Ok(())
+
+    Ok(leaf_publishers)
 }
 
-/// Attach a subscriber to the tree.
-/// Finds shallowest node with capacity and connects subscriber to it.
-/// Ensures parent is connected to tree before attaching.
-/// Prevents mixing proxies and subscribers as children of the same node.
-pub fn attach_subscriber(
+fn choose_leaf_for_subscriber(leaves: &[LeafPublisherView]) -> Option<LeafPublisherView> {
+    leaves
+        .iter()
+        .filter(|leaf| !leaf.distressed)
+        .min_by(|a, b| {
+            a.listener_count
+                .cmp(&b.listener_count)
+                .then_with(|| a.publisher.cmp(&b.publisher))
+        })
+        .cloned()
+}
+
+fn connection_load(
+    connections_map: &HashMap<GDPName, HashSet<GDPName>>,
+    node: GDPName,
+) -> usize {
+    connections_map
+        .get(&node)
+        .map(|subs| subs.len())
+        .unwrap_or(0)
+}
+
+/// Connect a subscriber to the best available leaf publisher.
+pub fn attach_subscriber_to_publisher(
     redis_url: &str,
     connections_key: &str,
     publishers_key: &str,
     proxies_key: &str,
     topic_name: &str,
     subscriber_name: GDPName,
-) -> bool {
-    // Load current state
-    let publishers = match get_publishers(redis_url, publishers_key) {
-        Ok(p) => p,
+) -> Result<bool, String> {
+    let distress_key = format!("{}-distress", publishers_key.strip_suffix("-publishers").unwrap_or(publishers_key));
+
+    // Get current connection state for up-to-date listener counts
+    let connections_map = build_connections_map(redis_url, connections_key)?;
+    let proxies = get_proxies(redis_url, proxies_key)?;
+    let distressed = get_distressed_nodes(redis_url, &distress_key)?;
+
+    // Find all leaf publishers with listener counts
+    let leaf_publishers = collect_leaf_publishers(redis_url, connections_key, publishers_key, proxies_key, &distress_key)?;
+
+    if leaf_publishers.is_empty() {
+        info!("No leaf publishers available for subscriber {} (topic: {}); will retry", subscriber_name, topic_name);
+        return Ok(false);
+    }
+
+    if let Some(selected_leaf) = choose_leaf_for_subscriber(&leaf_publishers) {
+        let connection = format!("{}-{}", selected_leaf.publisher, subscriber_name);
+        add_entity_to_database_as_transaction(redis_url, connections_key, &connection)
+            .map_err(|e| format!("Failed to create connection: {}", e))?;
+
+        info!(
+            "Connected subscriber {} to publisher {} (topic: {}, listeners: {}, distressed: {})",
+            subscriber_name,
+            selected_leaf.publisher,
+            topic_name,
+            selected_leaf.listener_count,
+            selected_leaf.distressed
+        );
+        return Ok(true);
+    }
+
+    // All leaves are distressed. Attach a proxy to the least-loaded distressed leaf if possible.
+    let distressed_target = leaf_publishers
+        .iter()
+        .filter(|leaf| leaf.distressed)
+        .min_by(|a, b| {
+            a.listener_count
+                .cmp(&b.listener_count)
+                .then_with(|| a.publisher.cmp(&b.publisher))
+        })
+        .cloned();
+
+    let topic_gdp = match GDPName::from_str(
+        publishers_key
+            .strip_suffix("-publishers")
+            .unwrap_or(publishers_key),
+    ) {
+        Ok(gdp) => gdp,
         Err(e) => {
-            error!("Failed to get publishers: {}", e);
-            return false;
+            warn!(
+                "Cannot parse topic GDP from key {} ({}); refusing to connect subscriber {}",
+                publishers_key, e, subscriber_name
+            );
+            return Ok(false);
         }
     };
 
-    let proxies = match get_proxies(redis_url, proxies_key) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("Failed to get proxies: {}", e);
-            return false;
-        }
-    };
+    if let Some(target_leaf) = distressed_target {
+        if let Some(proxy) = attach_proxy_to_distressed_publisher(
+            redis_url,
+            connections_key,
+            topic_gdp,
+            topic_name,
+            &connections_map,
+            &proxies,
+            &distressed,
+            target_leaf.publisher,
+        )? {
+            let connection = format!("{}-{}", proxy, subscriber_name);
+            add_entity_to_database_as_transaction(redis_url, connections_key, &connection)
+                .map_err(|e| format!("Failed to create connection to proxy: {}", e))?;
 
-    let mut connections = match build_connections_map(redis_url, connections_key) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to build connections map: {}", e);
-            return false;
-        }
-    };
-
-    // Find best parent (shallowest node with capacity)
-    let mut parent = match find_best_upstream(&publishers, &proxies, &connections, subscriber_name) {
-        Some(p) => p,
-        None => {
-            info!("No parent with capacity for subscriber {} (topic: {}); will retry", subscriber_name, topic_name);
-            return false;
-        }
-    };
-
-    // Only reorganize if parent is at capacity AND has mixed children
-    // This ensures we only introduce proxies when necessary (at max children limit)
-    let parent_children = connections.get(&parent).cloned().unwrap_or_default();
-    let parent_load = parent_children.len();
-    
-    if parent_load >= MAX_CHILDREN && has_mixed_children(&parent, &proxies, &connections) {
-        info!("Parent {} is at capacity ({}/{}) with mixed children, finding proxy to take over (topic: {})", 
-            parent, parent_load, MAX_CHILDREN, topic_name);
-        
-        // Find an available proxy that can take all children
-        let total_children = parent_children.len();
-        
-        // Look for a proxy with enough capacity to take all children
-        let candidate_proxy = proxies.iter()
-            .find(|&&proxy| {
-                proxy != parent && 
-                proxy != subscriber_name &&
-                has_capacity(&connections, &proxy) &&
-                child_count(&connections, &proxy) + total_children <= MAX_CHILDREN
-            })
-            .copied();
-        
-        if let Some(proxy) = candidate_proxy {
-            // Ensure proxy is connected
-            if !ensure_node_connected(&proxy, &publishers, &connections) {
-                if let Err(e) = connect_proxy_to_tree(
-                    redis_url, connections_key, publishers_key, proxies_key, topic_name, proxy,
-                ) {
-                    error!("Failed to connect proxy {} to tree: {}", proxy, e);
-                    return false;
-                }
-                
-                // Reload connections
-                connections = match build_connections_map(redis_url, connections_key) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to reload connections: {}", e);
-                        return false;
-                    }
-                };
-            }
-            
-            // Move all children to the proxy
-            if let Err(e) = move_children_to_new_parent(
-                redis_url, connections_key, parent, proxy, &parent_children,
-            ) {
-                error!("Failed to move children from {} to {}: {}", parent, proxy, e);
-                return false;
-            }
-            
-            info!("Moved {} children from {} to proxy {} (topic: {})", 
-                parent_children.len(), parent, proxy, topic_name);
-            
-            // Reload connections after moving
-            connections = match build_connections_map(redis_url, connections_key) {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to reload connections after move: {}", e);
-                    return false;
-                }
-            };
-            
-            parent = proxy;
-        } else {
-            // No suitable proxy found - this is a problem, but we'll proceed with warning
-            warn!("Parent {} is at capacity with mixed children but no suitable proxy found to take over (topic: {})", 
-                parent, topic_name);
+            info!(
+                "Connected subscriber {} to proxy {} (topic: {}, parent was distressed publisher {})",
+                subscriber_name, proxy, topic_name, target_leaf.publisher
+            );
+            return Ok(true);
         }
     }
 
-    // If parent is a proxy, ensure it's connected to tree
-    if proxies.contains(&parent) && !ensure_node_connected(&parent, &publishers, &connections) {
-        // Try to connect proxy to tree
-        if let Err(e) = connect_proxy_to_tree(
-            redis_url, connections_key, publishers_key, proxies_key, topic_name, parent,
-        ) {
-            error!("Failed to connect proxy {} to tree: {}", parent, e);
-            return false;
+    warn!(
+        "No safe publisher or proxy path available for subscriber {} on topic {}",
+        subscriber_name, topic_name
+    );
+    Ok(false)
+}
+
+/// When a proxy connects to a publisher, make the proxy a publisher too.
+pub fn make_proxy_publisher(
+    redis_url: &str,
+    topic_gdp: GDPName,
+    topic_name: &str,
+    proxy_name: GDPName,
+) -> Result<(), String> {
+    let publishers_key = format!("{}-publishers", topic_gdp);
+    let publishers = get_publishers(redis_url, &publishers_key)?;
+    
+    // Check if proxy is already a publisher
+    if publishers.contains(&proxy_name) {
+        return Ok(());
+    }
+    
+    // Register proxy as publisher
+    register_publisher(redis_url, topic_gdp, proxy_name, topic_name)
+        .map_err(|e| format!("Failed to register proxy as publisher: {}", e))?;
+    
+    info!("Proxy {} became a publisher for topic {}", proxy_name, topic_name);
+    Ok(())
+}
+
+/// Move one direct listener from a parent to another parent node.
+fn move_listener(
+    redis_url: &str,
+    connections_key: &str,
+    from_parent: GDPName,
+    to_parent: GDPName,
+    subscriber: GDPName,
+) -> Result<(), String> {
+    let old_connection = format!("{}-{}", from_parent, subscriber);
+    remove_entity_from_database_as_transaction(redis_url, connections_key, &old_connection)
+        .map_err(|e| format!("Failed to remove old connection: {}", e))?;
+
+    let new_connection = format!("{}-{}", to_parent, subscriber);
+    add_entity_to_database_as_transaction(redis_url, connections_key, &new_connection)
+        .map_err(|e| format!("Failed to add new connection: {}", e))?;
+
+    info!(
+        "Moved subscriber {} from {} to {}",
+        subscriber, from_parent, to_parent
+    );
+    Ok(())
+}
+
+/// Attach a proxy to a distressed publisher and promote it.
+/// Returns Ok(Some(proxy)) if attached, Ok(None) otherwise.
+fn attach_proxy_to_distressed_publisher(
+    redis_url: &str,
+    connections_key: &str,
+    topic_gdp: GDPName,
+    topic_name: &str,
+    connections_map: &HashMap<GDPName, HashSet<GDPName>>,
+    proxies: &[GDPName],
+    distressed: &HashSet<GDPName>,
+    distressed_parent: GDPName,
+) -> Result<Option<GDPName>, String> {
+    let proxies_set: HashSet<GDPName> = proxies.iter().copied().collect();
+
+    // Do not attach a proxy under another proxy; keep tree depth minimal.
+    if proxies_set.contains(&distressed_parent) {
+        warn!(
+            "Refusing to attach proxy under proxy {} to avoid deepening the tree",
+            distressed_parent
+        );
+        return Ok(None);
+    }
+
+    let attached_proxies: HashSet<GDPName> = connections_map
+        .values()
+        .flat_map(|subs| subs.iter().copied())
+        .filter(|node| proxies_set.contains(node))
+        .collect();
+
+    let mut available_proxies: Vec<GDPName> = proxies
+        .iter()
+        .copied()
+        .filter(|p| !distressed.contains(p))
+        .filter(|p| !attached_proxies.contains(p))
+        .collect();
+
+    if available_proxies.is_empty() {
+        warn!(
+            "No available non-distressed proxies to attach to parent {}",
+            distressed_parent
+        );
+        return Ok(None);
+    }
+
+    // Choose the least loaded available proxy (ties by GDPName) to balance the tree
+    available_proxies.sort_by(|a, b| {
+        connection_load(connections_map, *a)
+            .cmp(&connection_load(connections_map, *b))
+            .then_with(|| a.cmp(b))
+    });
+
+    let proxy = available_proxies[0];
+    let connection = format!("{}-{}", distressed_parent, proxy);
+    add_entity_to_database_as_transaction(redis_url, connections_key, &connection)
+        .map_err(|e| format!("Failed to attach proxy to parent {}: {}", distressed_parent, e))?;
+    
+    make_proxy_publisher(redis_url, topic_gdp, topic_name, proxy)?;
+    
+    info!("Attached proxy {} to {}", proxy, distressed_parent);
+    Ok(Some(proxy))
+}
+
+/// Handle distress for a publisher: move subscribers to proxies.
+pub fn handle_distressed_publisher(
+    redis_url: &str,
+    topic_gdp: GDPName,
+    topic_name: &str,
+    distressed_publisher: GDPName,
+) -> Result<(), String> {
+    let (publishers_key, connections_key, proxies_key, distress_key) = 
+        crate::connection_store::topic_redis_keys(topic_gdp);
+    
+    let publishers = get_publishers(redis_url, &publishers_key)?;
+    let proxies = get_proxies(redis_url, &proxies_key)?;
+    let publishers_set: HashSet<GDPName> = publishers.iter().copied().collect();
+    let proxies_set: HashSet<GDPName> = proxies.iter().copied().collect();
+    
+    if !publishers_set.contains(&distressed_publisher) && !proxies_set.contains(&distressed_publisher) {
+        return Ok(());
+    }
+    
+    let connections_map = build_connections_map(redis_url, &connections_key)?;
+    let distressed = get_distressed_nodes(redis_url, &distress_key)?;
+
+    if !distressed.contains(&distressed_publisher) {
+        return Ok(());
+    }
+
+    let child_count = connections_map
+        .get(&distressed_publisher)
+        .map(|subs| subs.len())
+        .unwrap_or(0);
+
+    // Distressed proxies do not re-parent listeners; only publishers move listeners to their own children.
+    if proxies_set.contains(&distressed_publisher) {
+        return Ok(());
+    }
+
+    let listener_children: Vec<GDPName> = connections_map
+        .get(&distressed_publisher)
+        .map(|subscribers| {
+            subscribers
+                .iter()
+                .filter(|&&sub| !proxies_set.contains(&sub) && !publishers_set.contains(&sub))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if listener_children.is_empty() {
+        return Ok(());
+    }
+
+    let proxy_children: Vec<GDPName> = connections_map
+        .get(&distressed_publisher)
+        .map(|subscribers| {
+            subscribers
+                .iter()
+                .filter(|&&sub| proxies_set.contains(&sub))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(target_proxy) = proxy_children
+        .iter()
+        .filter(|p| !distressed.contains(*p))
+        .min_by(|a, b| {
+            connection_load(&connections_map, **a)
+                .cmp(&connection_load(&connections_map, **b))
+                .then_with(|| a.cmp(b))
+        })
+        .copied()
+    {
+        let subscriber = listener_children
+            .iter()
+            .copied()
+            .min()
+            .ok_or_else(|| "Expected at least one listener to move".to_string())?;
+
+        move_listener(
+            redis_url,
+            &connections_key,
+            distressed_publisher,
+            target_proxy,
+            subscriber,
+        )?;
+
+        let remaining_children = child_count.saturating_sub(1);
+        if remaining_children >= PUBLISHER_DISTRESS_THRESHOLD {
+            let _ = attach_proxy_to_distressed_publisher(
+                redis_url,
+                &connections_key,
+                topic_gdp,
+                topic_name,
+                &connections_map,
+                &proxies,
+                &distressed,
+                distressed_publisher,
+            )?;
         }
+
+        return Ok(());
+    }
+
+    if let Some(proxy) = attach_proxy_to_distressed_publisher(
+        redis_url,
+        &connections_key,
+        topic_gdp,
+        topic_name,
+        &connections_map,
+        &proxies,
+        &distressed,
+        distressed_publisher,
+    )? {
+        let subscriber = listener_children
+            .iter()
+            .copied()
+            .min()
+            .ok_or_else(|| "Expected at least one listener to move".to_string())?;
+
+        move_listener(
+            redis_url,
+            &connections_key,
+            distressed_publisher,
+            proxy,
+            subscriber,
+        )?;
+    }
+    
+    Ok(())
+}
+
+/// Handle distress for this node (publisher or proxy).
+/// This function should be spawned as a background task and runs every 1 second.
+/// It checks if this node is distressed and handles it accordingly.
+pub async fn handle_own_distress(
+    redis_url: String,
+    topic_gdp: GDPName,
+    topic_name: String,
+    my_gdp_name: GDPName,
+) {
+    use tokio::time::{interval, Duration};
+    
+    let mut interval = interval(Duration::from_secs(1));
+    
+    loop {
+        interval.tick().await;
         
-        // Reload connections after connecting proxy
-        connections = match build_connections_map(redis_url, connections_key) {
-            Ok(c) => c,
+        let (_, _, _, distress_key) = crate::connection_store::topic_redis_keys(topic_gdp);
+        
+        // Check if this node is distressed
+        let distressed = match get_distressed_nodes(&redis_url, &distress_key) {
+            Ok(d) => d,
             Err(e) => {
-                error!("Failed to reload connections: {}", e);
-                return false;
+                error!("Failed to get distressed nodes: {}", e);
+                continue;
             }
         };
         
-        // Verify parent is now connected
-        if !ensure_node_connected(&parent, &publishers, &connections) {
-            error!("Proxy {} still not connected to tree after connection attempt", parent);
-            return false;
-        }
-    }
-
-    // Verify parent has capacity
-    if !has_capacity(&connections, &parent) {
-        info!("Parent {} at capacity for subscriber {} (topic: {})", parent, subscriber_name, topic_name);
-        return false;
-    }
-
-    // Create connection
-    let depth = node_depth(&parent, &publishers, &connections).unwrap_or(0);
-    let load = child_count(&connections, &parent);
-    info!(
-        "Attaching subscriber {} to {} (depth: {}, load: {}/{}) on topic {}",
-        subscriber_name, parent, depth, load, MAX_CHILDREN, topic_name
-    );
-
-    match create_connection(redis_url, connections_key, parent, subscriber_name) {
-        Ok(_) => true,
-        Err(e) => {
-            error!("Failed to create connection: {}", e);
-            false
+        // Only handle if this node is distressed
+        if distressed.contains(&my_gdp_name) {
+            if let Err(e) = handle_distressed_publisher(&redis_url, topic_gdp, &topic_name, my_gdp_name) {
+                error!("Failed to handle own distress for {}: {}", my_gdp_name, e);
+            }
         }
     }
 }

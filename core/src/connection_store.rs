@@ -19,11 +19,12 @@ pub fn connection_id(topic_gdp: GDPName, connection: &Connection) -> String {
 }
 
 /// Generate Redis topic names for a given topic GDP.
-pub fn topic_redis_keys(topic_gdp: GDPName) -> (String, String, String) {
+pub fn topic_redis_keys(topic_gdp: GDPName) -> (String, String, String, String) {
     (
         format!("{}-publishers", topic_gdp),
         format!("{}-connections", topic_gdp),
         format!("{}-proxies", topic_gdp),
+        format!("{}-distress", topic_gdp),
     )
 }
 
@@ -70,6 +71,26 @@ pub fn get_proxies(redis_url: &str, proxy_key: &str) -> Result<Vec<GDPName>, Str
             Ok(name) => result.push(name),
             Err(e) => {
                 error!("Failed to parse proxy GDP name '{}': {:?}", gdp_name_string, e);
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Get all distressed nodes from Redis for a topic.
+pub fn get_distressed_nodes(redis_url: &str, distress_key: &str) -> Result<std::collections::HashSet<GDPName>, String> {
+    use crate::db::get_entity_from_database;
+    let distressed = get_entity_from_database(redis_url, distress_key)
+        .map_err(|e| format!("Failed to get distressed nodes from Redis: {}", e))?;
+    
+    let mut result = std::collections::HashSet::new();
+    for gdp_name_string in distressed {
+        match GDPName::from_str(&gdp_name_string) {
+            Ok(name) => {
+                result.insert(name);
+            }
+            Err(e) => {
+                error!("Failed to parse distressed GDP name '{}': {:?}", gdp_name_string, e);
             }
         }
     }

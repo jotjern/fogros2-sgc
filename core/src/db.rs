@@ -200,34 +200,20 @@ pub fn register_publisher(
     Ok(())
 }
 
-/// Get Docker container name from Docker metadata.
-/// For docker-compose, this gets the unique container name like "fogros2-sgc-lite-proxy-10".
-/// 
-/// Docker Compose sets the container name in the format: <project>-<service>-<instance>
-/// The container name is available via:
-/// 1. HOSTNAME environment variable (set by docker-compose to container name)
-/// 2. /etc/hostname file (contains the hostname/container name)
-/// 
-/// # Panics
-/// Panics if container name cannot be determined - this indicates a configuration issue.
+/// Get Docker container name. Panics if not available.
 pub fn get_container_name() -> String {
-    // First try CONTAINER_NAME if explicitly set (for manual overrides)
     if let Ok(name) = std::env::var("CONTAINER_NAME") {
         if !name.is_empty() {
             return name;
         }
     }
     
-    // docker-compose sets HOSTNAME to the container name
-    // For scaled services: "fogros2-sgc-lite-proxy-10", "fogros2-sgc-lite-listener-3", etc.
-    // For non-scaled: "fogros2-sgc-lite-talker-1", "fogros2-sgc-lite-rib-1", etc.
     if let Ok(hostname) = std::env::var("HOSTNAME") {
         if !hostname.is_empty() {
             return hostname;
         }
     }
     
-    // Fallback: read from /etc/hostname (should match HOSTNAME)
     if let Ok(contents) = std::fs::read_to_string("/etc/hostname") {
         let trimmed = contents.trim();
         if !trimmed.is_empty() {
@@ -235,8 +221,6 @@ pub fn get_container_name() -> String {
         }
     }
     
-    // Hard crash if container name cannot be determined
-    // This indicates a serious configuration issue that needs immediate attention
     panic!(
         "CRITICAL: Cannot determine container name! \
         Checked CONTAINER_NAME env var, HOSTNAME env var, and /etc/hostname file. \

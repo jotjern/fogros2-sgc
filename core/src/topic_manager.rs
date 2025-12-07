@@ -131,6 +131,91 @@ async fn handle_new_connection(
     Some(shutdown_tx)
 }
 
+/// Check if this node is involved in the connection (either as publisher or subscriber).
+fn is_node_involved(connection: &Connection, my_gdp_name: GDPName) -> bool {
+    connection.publisher == my_gdp_name || connection.subscriber == my_gdp_name
+}
+
+/// Generate connection identifier for tracking connections.
+fn connection_identifier(topic_gdp: GDPName, connection: &Connection) -> String {
+    format!("{}-{}", topic_gdp, connection.to_string())
+}
+
+/// Handle a new connection being added to Redis.
+async fn handle_connection_added(
+    connection_string: String,
+    topic_name: &str,
+    topic_type: &str,
+    certificate: &[u8],
+    topic_gdp: GDPName,
+    my_gdp_name: GDPName,
+    connections: &mut HashMap<String, broadcast::Sender<()>>,
+) {
+    let connection = match Connection::from_str(&connection_string) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to parse connection {}: {:?}", connection_string, e);
+            return;
+        }
+    };
+
+    let connection_id = connection_identifier(topic_gdp, &connection);
+
+    if !is_node_involved(&connection, my_gdp_name) {
+        info!(
+            "Skipping connection not involving this node: publisher {}, subscriber {}, me {}",
+            connection.publisher, connection.subscriber, my_gdp_name
+        );
+        return;
+    }
+
+    match handle_new_connection(
+        connection,
+        topic_name,
+        topic_type,
+        certificate,
+        my_gdp_name,
+        topic_gdp,
+    )
+    .await
+    {
+        Some(shutdown_sender) => {
+            connections.insert(connection_id.clone(), shutdown_sender);
+            info!("Successfully established connection: {}", connection_id);
+        }
+        None => {
+            error!("Failed to establish connection: {}", connection_id);
+        }
+    }
+}
+
+/// Handle a connection being removed from Redis.
+fn handle_connection_removed(
+    connection_string: String,
+    topic_gdp: GDPName,
+    connections_topic: &str,
+    connections: &mut HashMap<String, broadcast::Sender<()>>,
+) {
+    let connection = match Connection::from_str(&connection_string) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to parse removed connection {}: {:?}", connection_string, e);
+            return;
+        }
+    };
+
+    let connection_id = connection_identifier(topic_gdp, &connection);
+
+    if let Some(shutdown) = connections.remove(&connection_id) {
+        let _ = shutdown.send(());
+        info!("Shutdown signal sent for connection: {}", connection_id);
+    }
+    info!(
+        "Connection removed from {}: {}",
+        connections_topic, connection_string
+    );
+}
+
 // This node receives from remote and publishes to local ROS
 // 1. Check Redis for existing subscribers in {topic}-sub
 // 2. For each subscriber, create WebRTC connection and listen
@@ -157,57 +242,24 @@ async fn create_topic_network_bridge(
     while let Some(event) = connection_changes.recv().await {
         match event {
             RedisListChange::Added(connection_string) => {
-                info!("NEW CONNECTION: {}", connection_string);
-                let connection = match Connection::from_str(connection_string.as_str()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!("Failed to parse connection {}: {:?}", connection_string, e);
-                        continue;
-                    }
-                };
-
-                let topic_name_cloned = topic_name.clone();
-                let topic_type_cloned = topic_type.clone();
-                let certificate_cloned = certificate.clone();
-
-                let connection_identifier = format!("{}-{}", topic_gdp, connection.to_string());
-
-                if connection.publisher != my_gdp_name && connection.subscriber != my_gdp_name {
-                    info!(
-                        "Im not involved: publisher {}, subscriber {}, me {}",
-                        connection.publisher, connection.subscriber, my_gdp_name
-                    );
-                    continue;
-                }
-
-                match handle_new_connection(
-                    connection,
-                    &topic_name_cloned,
-                    &topic_type_cloned,
-                    &certificate_cloned,
-                    my_gdp_name,
+                info!("New connection detected: {}", connection_string);
+                handle_connection_added(
+                    connection_string,
+                    &topic_name,
+                    &topic_type,
+                    &certificate,
                     topic_gdp,
+                    my_gdp_name,
+                    &mut connections,
                 )
-                .await
-                {
-                    Some(shutdown_sender) => {
-                        connections.insert(connection_identifier.clone(), shutdown_sender);
-                        info!("Successfully established connection: {}", connection_identifier);
-                    }
-                    None => {
-                        error!("Failed to establish connection: {}", connection_identifier);
-                    }
-                }
+                .await;
             }
-            RedisListChange::Removed(connection) => {
-                let connection_identifier = format!("{}-{}", topic_gdp, connection.to_string());
-
-                if let Some(shutdown) = connections.remove(&connection_identifier) {
-                    let _ = shutdown.send(());
-                }
-                info!(
-                    "Removed remote subscriber from {}: {}",
-                    connections_topic, connection
+            RedisListChange::Removed(connection_string) => {
+                handle_connection_removed(
+                    connection_string,
+                    topic_gdp,
+                    &connections_topic,
+                    &mut connections,
                 );
             }
         }

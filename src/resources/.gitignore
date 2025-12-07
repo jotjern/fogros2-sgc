@@ -12,3 +12,6 @@
 !h264_decoder.toml
 !turtlebot_client.toml
 !turtlebot.toml
+!listener-docker.toml
+!talker-docker.toml
+!proxy-docker.toml

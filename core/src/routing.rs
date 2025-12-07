@@ -1,10 +1,10 @@
 use crate::connection_store::{build_connections_map, get_proxies, get_publishers};
-use crate::db::add_entity_to_database_as_transaction;
+use crate::db::{add_entity_to_database_as_transaction, remove_entity_from_database_as_transaction};
 use crate::structs::GDPName;
-use log::{error, info};
+use log::{error, info, warn};
 use std::collections::{HashMap, HashSet};
 
-const MAX_CHILDREN: usize = 3;
+const MAX_CHILDREN: usize = 5;
 
 /// Get number of children for a node.
 fn child_count(connections: &HashMap<GDPName, HashSet<GDPName>>, node: &GDPName) -> usize {
@@ -58,7 +58,23 @@ fn node_depth(
     None
 }
 
+/// Check if a node has mixed children (both proxies and subscribers).
+fn has_mixed_children(
+    node: &GDPName,
+    proxies: &[GDPName],
+    connections: &HashMap<GDPName, HashSet<GDPName>>,
+) -> bool {
+    if let Some(children) = connections.get(node) {
+        let has_proxy = children.iter().any(|child| proxies.contains(child));
+        let has_subscriber = children.iter().any(|child| !proxies.contains(child));
+        has_proxy && has_subscriber
+    } else {
+        false
+    }
+}
+
 /// Find the best upstream node for a new node (shallowest with capacity).
+/// Prioritizes shallow nodes to keep tree depth minimal.
 fn find_best_upstream(
     publishers: &[GDPName],
     proxies: &[GDPName],
@@ -76,7 +92,7 @@ fn find_best_upstream(
         return None;
     }
 
-    // Sort by: 1) depth (shallowest first), 2) load (least loaded first)
+    // Sort by: 1) depth (shallowest first - strong priority), 2) load (least loaded first)
     candidates.sort_by(|a, b| {
         let depth_a = node_depth(a, publishers, connections).unwrap_or(usize::MAX);
         let depth_b = node_depth(b, publishers, connections).unwrap_or(usize::MAX);
@@ -150,9 +166,33 @@ fn ensure_node_connected(
     node_depth(node, publishers, connections).is_some()
 }
 
+/// Move all children from one parent to another.
+fn move_children_to_new_parent(
+    redis_url: &str,
+    connections_key: &str,
+    old_parent: GDPName,
+    new_parent: GDPName,
+    children: &HashSet<GDPName>,
+) -> Result<(), String> {
+    // Remove old connections
+    for child in children {
+        let old_conn = format!("{}-{}", old_parent, child);
+        remove_entity_from_database_as_transaction(redis_url, connections_key, &old_conn)
+            .map_err(|e| format!("Failed to remove old connection {}: {}", old_conn, e))?;
+    }
+    
+    // Create new connections
+    for child in children {
+        create_connection(redis_url, connections_key, new_parent, *child)?;
+    }
+    
+    Ok(())
+}
+
 /// Attach a subscriber to the tree.
 /// Finds shallowest node with capacity and connects subscriber to it.
 /// Ensures parent is connected to tree before attaching.
+/// Prevents mixing proxies and subscribers as children of the same node.
 pub fn attach_subscriber(
     redis_url: &str,
     connections_key: &str,
@@ -187,13 +227,79 @@ pub fn attach_subscriber(
     };
 
     // Find best parent (shallowest node with capacity)
-    let parent = match find_best_upstream(&publishers, &proxies, &connections, subscriber_name) {
+    let mut parent = match find_best_upstream(&publishers, &proxies, &connections, subscriber_name) {
         Some(p) => p,
         None => {
             info!("No parent with capacity for subscriber {} (topic: {}); will retry", subscriber_name, topic_name);
             return false;
         }
     };
+
+    // If parent has mixed children (proxies and subscribers), find a proxy to take over
+    if has_mixed_children(&parent, &proxies, &connections) {
+        info!("Parent {} has mixed children, finding proxy to take over (topic: {})", parent, topic_name);
+        
+        // Find an available proxy that can take all children
+        let children = connections.get(&parent).cloned().unwrap_or_default();
+        let total_children = children.len();
+        
+        // Look for a proxy with enough capacity to take all children
+        let candidate_proxy = proxies.iter()
+            .find(|&&proxy| {
+                proxy != parent && 
+                proxy != subscriber_name &&
+                has_capacity(&connections, &proxy) &&
+                child_count(&connections, &proxy) + total_children <= MAX_CHILDREN
+            })
+            .copied();
+        
+        if let Some(proxy) = candidate_proxy {
+            // Ensure proxy is connected
+            if !ensure_node_connected(&proxy, &publishers, &connections) {
+                if let Err(e) = connect_proxy_to_tree(
+                    redis_url, connections_key, publishers_key, proxies_key, topic_name, proxy,
+                ) {
+                    error!("Failed to connect proxy {} to tree: {}", proxy, e);
+                    return false;
+                }
+                
+                // Reload connections
+                connections = match build_connections_map(redis_url, connections_key) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!("Failed to reload connections: {}", e);
+                        return false;
+                    }
+                };
+            }
+            
+            // Move all children to the proxy
+            if let Err(e) = move_children_to_new_parent(
+                redis_url, connections_key, parent, proxy, &children,
+            ) {
+                error!("Failed to move children from {} to {}: {}", parent, proxy, e);
+                return false;
+            }
+            
+            info!("Moved {} children from {} to proxy {} (topic: {})", 
+                children.len(), parent, proxy, topic_name);
+            
+            // Reload connections after moving
+            connections = match build_connections_map(redis_url, connections_key) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to reload connections after move: {}", e);
+                    return false;
+                }
+            };
+            
+            parent = proxy;
+        } else {
+            // No suitable proxy found - this is a problem, but we'll proceed with warning
+            warn!("Parent {} has mixed children but no suitable proxy found to take over (topic: {})", 
+                parent, topic_name);
+        }
+    }
 
     // If parent is a proxy, ensure it's connected to tree
     if proxies.contains(&parent) && !ensure_node_connected(&parent, &publishers, &connections) {

@@ -291,6 +291,8 @@ pub async fn ros_topic_discovery() {
     } else {
         info!("Published GDP name mapping: {} -> {}", my_gdp_name.to_string(), container_name);
     }
+    
+    info!("Node {} ({}) registered but not yet connected to any topics", my_gdp_name.to_string(), container_name);
 
     // Setup each topic: spawn watcher and register role
     for topic in config.ros {

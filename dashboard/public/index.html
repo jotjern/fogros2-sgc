@@ -430,6 +430,7 @@
       const proxySet = new Set(data.proxies || []);
       const publisherSet = new Set();
       const gdpMappings = data.gdpMappings || {};
+      const unconnectedSet = new Set(data.unconnectedNodes || []);
 
       // First pass: identify publishers from connection sources
       data.connections.forEach(conn => {
@@ -447,7 +448,8 @@
             ? 'publisher'
             : 'other';
         const containerName = gdpMappings[id] || null;
-        nodes.push({ id, type, containerName });
+        const isUnconnected = unconnectedSet.has(id);
+        nodes.push({ id, type, containerName, isUnconnected });
         nodeSet.add(id);
       };
 
@@ -627,10 +629,12 @@
 
       node = nodeEnter.merge(nodeSelection)
         .attr('fill', d => {
+          if (d.isUnconnected) return '#ffaa00';
           if (d.type === 'proxy') return '#ff6b6b';
           if (d.type === 'publisher') return '#4ecdc4';
           return '#5c7cfa';
-        });
+        })
+        .attr('opacity', d => d.isUnconnected ? 0.6 : 1.0);
 
       // Update node labels
       const nodeLabelSelection = g.select('.node-labels')
@@ -670,7 +674,7 @@
       if (simulation) {
         simulation.nodes(graphData.nodes);
         simulation.force('link').links(graphData.links);
-        simulation.alpha(0.3).restart();
+        simulation.alpha(0.1).restart();
       } else {
         simulation = d3.forceSimulation(graphData.nodes)
           .force('link', d3.forceLink(graphData.links).id(d => d.id).distance(180))
@@ -678,6 +682,8 @@
           .force('center', d3.forceCenter(width / 2, height / 2))
           .force('collision', d3.forceCollide().radius(NODE_RADIUS + 20))
           .force('bounds', boundingForce())
+          .alphaDecay(0.022)
+          .velocityDecay(0.4)
           .on('tick', ticked);
       }
     }

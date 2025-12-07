@@ -144,12 +144,28 @@ io.on('connection', (socket) => {
         }
       }
 
+      // Find unconnected nodes (nodes that exist but have no connections)
+      const connectedNodes = new Set();
+      connections.forEach(conn => {
+        const [publisher, , subscriber] = conn.split(',');
+        if (publisher) connectedNodes.add(publisher);
+        if (subscriber) connectedNodes.add(subscriber);
+      });
+      
+      const allNodes = new Set([...nodesSet, ...proxySet]);
+      const unconnectedNodes = Array.from(allNodes).filter(node => !connectedNodes.has(node));
+      
+      if (unconnectedNodes.length > 0) {
+        console.log(`[Dashboard] Unconnected nodes (${unconnectedNodes.length}):`, unconnectedNodes.map(n => gdpMappings[n] || n).join(', '));
+      }
+
       socket.emit('redis-data', {
         nodes: Array.from(nodesSet),
         proxies: Array.from(proxySet),
         connections,
         topics,
-        gdpMappings
+        gdpMappings,
+        unconnectedNodes
       });
     } catch (err) {
       socket.emit('redis-error', err.message);

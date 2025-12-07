@@ -200,45 +200,32 @@ pub fn register_publisher(
     Ok(())
 }
 
-/// Get Docker container name from environment variables or Docker metadata.
-/// Prefers CONTAINER_NAME (set in docker-compose) over container hostname.
-/// For scaled services, this will get the full container name like "fogros2-sgc-lite-listener-1".
+/// Get Docker container name from Docker metadata.
+/// For docker-compose, this gets the unique container name like "fogros2-sgc-lite-proxy-10".
+/// 
+/// Docker Compose sets the container name in the format: <project>-<service>-<instance>
+/// The container name is available via:
+/// 1. HOSTNAME environment variable (set by docker-compose to container name)
+/// 2. /etc/hostname file (contains the hostname/container name)
+/// 3. /proc/self/cgroup (contains container ID, but we want the name)
 pub fn get_container_name() -> String {
-    // First try CONTAINER_NAME (explicitly set in docker-compose)
+    // First try CONTAINER_NAME if explicitly set (for manual overrides)
     if let Ok(name) = std::env::var("CONTAINER_NAME") {
         if !name.is_empty() {
             return name;
         }
     }
     
-    // Try to get container name from /proc/self/cgroup
-    // Docker sets cgroup paths like: .../docker/<container_id> or .../<container_name>
-    // For docker-compose: .../docker/<container_id> where container_id maps to name
-    // We can also check /proc/self/mountinfo for container name hints
-    if let Ok(contents) = std::fs::read_to_string("/proc/self/cgroup") {
-        for line in contents.lines() {
-            // Look for docker container identifier in cgroup path
-            let parts: Vec<&str> = line.split('/').collect();
-            if let Some(last_part) = parts.last() {
-                // Docker container IDs are typically 64 hex chars, but we want the name
-                // The container name might be in the path or we need to resolve ID -> name
-            }
-        }
-    }
-    
-    // Try to get container name from hostname
-    // docker-compose sets HOSTNAME to the container name for scaled services
-    // Format: <project>-<service>-<instance> or just <service>-<instance>
+    // docker-compose sets HOSTNAME to the container name
+    // For scaled services: "fogros2-sgc-lite-proxy-10", "fogros2-sgc-lite-listener-3", etc.
+    // For non-scaled: "fogros2-sgc-lite-talker-1", "fogros2-sgc-lite-rib-1", etc.
     if let Ok(hostname) = std::env::var("HOSTNAME") {
         if !hostname.is_empty() {
-            // HOSTNAME in docker-compose is typically the container name
-            // For scaled: "fogros2-sgc-lite-listener-1" or "listener-1"
-            // For non-scaled: service name like "talker", "listener", "proxy"
             return hostname;
         }
     }
     
-    // Last resort: try to read from /etc/hostname
+    // Fallback: read from /etc/hostname (should match HOSTNAME)
     if let Ok(contents) = std::fs::read_to_string("/etc/hostname") {
         let trimmed = contents.trim();
         if !trimmed.is_empty() {
@@ -246,6 +233,9 @@ pub fn get_container_name() -> String {
         }
     }
     
+    // Last resort: try to extract from /proc/self/cgroup
+    // This contains the container ID, but we can't easily map ID -> name without docker socket
+    // So we'll just return unknown
     "unknown".to_string()
 }
 

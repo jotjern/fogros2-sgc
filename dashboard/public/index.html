@@ -199,12 +199,23 @@
     }
 
     .node-label {
-      font-size: 14px;
+      font-size: 12px;
       font-weight: 600;
       fill: #fff;
       text-anchor: middle;
       dominant-baseline: middle;
       pointer-events: none;
+    }
+    
+    .node-label-container {
+      font-size: 14px;
+      font-weight: 700;
+    }
+    
+    .node-label-gdp {
+      font-size: 10px;
+      font-weight: 400;
+      fill: rgba(255, 255, 255, 0.7);
     }
 
     .edge-label {
@@ -623,23 +634,38 @@
 
       // Update node labels
       const nodeLabelSelection = g.select('.node-labels')
-        .selectAll('text')
+        .selectAll('g')
         .data(graphData.nodes, d => d.id);
 
       nodeLabelSelection.exit().remove();
 
       const nodeLabelEnter = nodeLabelSelection.enter()
-        .append('text')
-        .attr('class', 'node-label');
+        .append('g')
+        .attr('class', 'node-label-group');
 
-      nodeLabel = nodeLabelEnter.merge(nodeLabelSelection)
-        .text(d => {
-          // Show container name if available, otherwise GDP name
-          if (d.containerName && d.containerName !== 'unknown') {
-            return `${d.containerName}\n(${d.id})`;
-          }
-          return d.id;
-        });
+      nodeLabel = nodeLabelEnter.merge(nodeLabelSelection);
+      
+      // Remove old text elements
+      nodeLabel.selectAll('text').remove();
+      
+      // Add container name if available
+      nodeLabel.each(function(d) {
+        const g = d3.select(this);
+        if (d.containerName && d.containerName !== 'unknown') {
+          g.append('text')
+            .attr('class', 'node-label node-label-container')
+            .attr('dy', '-4')
+            .text(d.containerName);
+          g.append('text')
+            .attr('class', 'node-label node-label-gdp')
+            .attr('dy', '8')
+            .text(`(${d.id})`);
+        } else {
+          g.append('text')
+            .attr('class', 'node-label')
+            .text(d.id);
+        }
+      });
 
       if (simulation) {
         simulation.nodes(graphData.nodes);
@@ -739,8 +765,7 @@
         .attr('cy', d => d.y);
 
       nodeLabel
-        .attr('x', d => d.x)
-        .attr('y', d => d.y);
+        .attr('transform', d => `translate(${d.x},${d.y})`);
     }
 
     function dragstarted(event) {

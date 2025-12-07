@@ -1,7 +1,7 @@
 use crate::db::{watch_redis_list_items, RedisListChange};
 use crate::structs::{Connection, GDPName};
-use log::{error, info};
-use std::collections::HashMap;
+use log::error;
+use log::info;
 use std::str::FromStr;
 use tokio::sync::mpsc::UnboundedReceiver;
 

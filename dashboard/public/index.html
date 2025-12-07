@@ -389,6 +389,8 @@
 
     // Auto-connect on load
     window.addEventListener('load', () => {
+      // Show disconnected overlay initially
+      document.getElementById('disconnectedOverlay').classList.remove('hidden');
       socket.emit('connect-redis', {
         host: elements.host.value,
         port: parseInt(elements.port.value) || 6379

@@ -200,15 +200,31 @@ pub fn register_publisher(
     Ok(())
 }
 
-/// Register a GDP name as a proxy for a topic in Redis.
+/// Register a GDP name as a proxy for a topic in Redis and connect it to the tree.
 pub fn register_proxy(
     redis_url: &str,
     topic_gdp: crate::structs::GDPName,
     gdp_name: crate::structs::GDPName,
+    topic_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let proxy_key = format!("{}-proxies", topic_gdp);
+    let publishers_key = format!("{}-publishers", topic_gdp);
+    let connections_key = format!("{}-connections", topic_gdp);
+    
+    // Register proxy in Redis
     add_entity_to_database_as_transaction(redis_url, &proxy_key, &gdp_name.to_string())
         .map_err(|e| format!("Failed to register as proxy: {}", e))?;
     info!("Registered as proxy (GDP: {})", gdp_name);
+    
+    // Connect proxy to tree (publisher or upstream proxy)
+    crate::routing::connect_proxy_to_tree(
+        redis_url,
+        &connections_key,
+        &publishers_key,
+        &proxy_key,
+        topic_name,
+        gdp_name,
+    ).map_err(|e| format!("Failed to connect proxy to tree: {}", e))?;
+    
     Ok(())
 }

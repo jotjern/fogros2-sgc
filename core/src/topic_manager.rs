@@ -241,7 +241,7 @@ fn setup_topic(
             ));
         }
         "proxy" => {
-            if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name) {
+            if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as proxy: {}", e);
             }
         }

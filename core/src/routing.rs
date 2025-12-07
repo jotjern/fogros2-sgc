@@ -160,6 +160,70 @@ fn create_connection(
     Ok(())
 }
 
+/// Connect a proxy to the tree by finding and connecting to an upstream node (publisher or proxy).
+/// This ensures the proxy is part of the tree and can receive messages.
+pub fn connect_proxy_to_tree(
+    redis_url: &str,
+    connections_key: &str,
+    publishers_key: &str,
+    proxies_key: &str,
+    topic_name: &str,
+    proxy_gdp_name: GDPName,
+) -> Result<(), String> {
+    // Load current state
+    let publishers = get_publishers(redis_url, publishers_key)?;
+    let proxies = get_proxies(redis_url, proxies_key)?;
+    let connections = build_connections_map(redis_url, connections_key)?;
+
+    // Check if proxy already has an upstream connection
+    let has_upstream = publishers.iter().any(|&p| {
+        connections.get(&p).map(|children| children.contains(&proxy_gdp_name)).unwrap_or(false)
+    }) || proxies.iter().any(|&p| {
+        p != proxy_gdp_name && connections.get(&p).map(|children| children.contains(&proxy_gdp_name)).unwrap_or(false)
+    });
+
+    if has_upstream {
+        info!("Proxy {} already has upstream connection", proxy_gdp_name);
+        return Ok(());
+    }
+
+    // Find best upstream node (prefer publisher, then shallowest proxy with capacity)
+    let upstream = if !publishers.is_empty() {
+        // Prefer connecting to a publisher with capacity
+        publishers.iter()
+            .filter(|&&p| has_capacity(&connections, &p))
+            .min_by_key(|p| get_child_count(&connections, p))
+            .copied()
+    } else if !proxies.is_empty() {
+        // No publishers: connect to shallowest proxy with capacity
+        proxies.iter()
+            .filter(|&&p| p != proxy_gdp_name && has_capacity(&connections, &p))
+            .min_by_key(|p| {
+                let depth = calculate_depth(p, &publishers, &connections).unwrap_or(usize::MAX);
+                (depth, get_child_count(&connections, p))
+            })
+            .copied()
+    } else {
+        None
+    };
+
+    match upstream {
+        Some(upstream_node) => {
+            create_connection(redis_url, connections_key, upstream_node, proxy_gdp_name)?;
+            let node_type = if publishers.contains(&upstream_node) { "publisher" } else { "proxy" };
+            info!(
+                "Connected proxy {} to {} {} (topic: {})",
+                proxy_gdp_name, node_type, upstream_node, topic_name
+            );
+            Ok(())
+        }
+        None => {
+            info!("No upstream node available for proxy {} (topic: {}); will connect when available", proxy_gdp_name, topic_name);
+            Ok(())
+        }
+    }
+}
+
 /// Attach a subscriber to the tree structure, maintaining hierarchy with max 3 children per node.
 /// Returns true if a connection was successfully created.
 pub fn attach_subscriber(
@@ -187,7 +251,7 @@ pub fn attach_subscriber(
         }
     };
 
-    let connections = match build_connections_map(redis_url, connections_key) {
+    let mut connections = match build_connections_map(redis_url, connections_key) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to build connections map: {}", e);
@@ -211,10 +275,20 @@ pub fn attach_subscriber(
             &publishers, &proxies, &connections, my_gdp_name,
         ) {
             error!("Failed to ensure proxy upstream: {}", e);
+            return false;
         }
+        
+        // Reload connections after ensuring upstream (may have added connection)
+        connections = match build_connections_map(redis_url, connections_key) {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to reload connections map: {}", e);
+                return false;
+            }
+        };
     }
 
-    // Verify parent still has capacity (may have changed)
+    // Verify parent has capacity
     if !has_capacity(&connections, &parent) {
         info!("Parent {} is at capacity; subscriber {} will retry later", parent, my_gdp_name);
         return false;

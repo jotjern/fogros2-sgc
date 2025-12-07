@@ -13,6 +13,7 @@ use utils::app_config::AppConfig;
 use crate::db::*;
 
 /// Generate signal IDs for WebRTC signaling based on connection and topic GDP name.
+/// Returns: (publisher_signal_id, subscriber_signal_id, my_signal_id, signal_id_to_dial)
 fn generate_signal_ids(
     topic_gdp: GDPName,
     connection: &Connection,
@@ -26,12 +27,14 @@ fn generate_signal_ids(
         "{}-{}-{}",
         topic_gdp, connection.subscriber, connection.publisher
     );
-    let my_signal_id = if connection.publisher == my_gdp_name {
+    
+    let is_publisher = connection.publisher == my_gdp_name;
+    let my_signal_id = if is_publisher {
         publisher_signal_id.clone()
     } else {
         subscriber_signal_id.clone()
     };
-    let signal_id_to_dial = if connection.publisher == my_gdp_name {
+    let signal_id_to_dial = if is_publisher {
         None
     } else {
         Some(publisher_signal_id.clone())

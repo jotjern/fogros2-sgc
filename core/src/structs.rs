@@ -132,10 +132,7 @@ pub struct GDPHeaderInTransit {
 
 impl Packet for GDPPacket {
     fn get_byte_payload(&self) -> Option<&Vec<u8>> {
-        match &self.payload {
-            Some(p) => Some(p),
-            None => None, // TODO
-        }
+        self.payload.as_ref()
     }
 
     fn get_header(&self) -> GDPHeaderInTransit {

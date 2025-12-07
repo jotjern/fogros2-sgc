@@ -83,10 +83,9 @@ fn remove_client_from_rib(client_id: &str) {
 
     // Build topic key using the first 4 comma-separated elements of client_id
     let topic_key_name = client_id
-        .split(',')
-        .take(4)
-        .collect::<Vec<&str>>()
-        .join(",");
+        .split('-')
+        .next()
+        .unwrap();
     // Publisher and subscriber Redis list keys
     let publisher_topic = format!("{}-pub", topic_key_name.clone());
     let subscriber_topic = format!("{}-sub", topic_key_name.clone());
@@ -123,11 +122,9 @@ fn remove_client_from_rib(client_id: &str) {
     // For publisher-side format (topic,pub,sub): extracts pub → removal fails (expected)
     // For subscriber-side format (topic,sub,pub): extracts sub → removal succeeds
     let subscriber_name = client_id
-        .split(',')
-        .skip(4)
-        .take(4)
-        .collect::<Vec<&str>>()
-        .join(",");
+        .split('-')
+        .nth(1)
+        .unwrap();
 
     // Remove subscriber_name from the subscriber list in Redis
     let result: Result<isize, redis::RedisError> =
@@ -205,7 +202,7 @@ async fn handle(clients: ClientsMap, stream: TcpStream) {
                     println!("Client {} >> {}", &remote_id, &text);
                     remote.unbounded_send(Message::text(text)).unwrap();
                 }
-                _ => println!("Client {} not found", &remote_id),
+                None => eprintln!("ERROR: Client {} not found", &remote_id),
             }
         }
         future::ok(())

@@ -46,6 +46,7 @@ fn main() -> Result<()> {
 
     AppConfig::init(Some(&config_contents))?;
 
+    
     // Match Commands
     cli::cli_match()?;
 

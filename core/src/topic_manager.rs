@@ -1,302 +1,316 @@
-use crate::network::ros::{ros_publisher, ros_subscriber};
+use crate::connection_store::{connection_id, is_node_involved, parse_connection, topic_redis_keys, watch_topic_connections};
+use crate::db::{get_redis_url, register_proxy, register_publisher, RedisListChange};
+use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
-use crate::structs::{
-    gdp_name_to_string, generate_random_gdp_name, get_gdp_name_from_topic, GDPName,
-};
+use crate::routing::attach_subscriber;
+use crate::structs::{Connection, GDPName, generate_random_gdp_name, get_gdp_name_from_topic};
 
-use async_datachannel::DataStream;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use tokio::process::Command;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
-use tokio::time::{sleep, Duration};
+use std::collections::HashMap;
+use rand::Rng;
+use tokio::sync::{broadcast, mpsc::unbounded_channel};
+use tokio::time::Duration;
 use utils::app_config::AppConfig;
 
-use crate::db::*;
-use futures::StreamExt;
-use redis_async::client;
+// Constants for timing and delays
+const SUBSCRIBER_ATTACH_BASE_DELAY_MS: u64 = 2000;
+const SUBSCRIBER_ATTACH_RANDOM_DELAY_MS: u64 = 1000;
+const MAIN_LOOP_SLEEP_MS: u64 = 1000;
 
-async fn watch_new_redis_list_items(list_key: String) -> UnboundedReceiver<String> {
-    let redis_url = get_redis_url();
-    allow_keyspace_notification(&redis_url).unwrap();
+/// Generate signal ID for this node and optionally the ID to dial (if subscriber).
+fn generate_signal_ids(
+    topic_gdp: GDPName,
+    connection: &Connection,
+    my_gdp_name: GDPName,
+) -> (String, Option<String>) {
+    let is_publisher = connection.publisher == my_gdp_name;
+    let my_signal_id = if is_publisher {
+        format!("{}-{}-{}", topic_gdp, connection.publisher, connection.subscriber)
+    } else {
+        format!("{}-{}-{}", topic_gdp, connection.subscriber, connection.publisher)
+    };
+    let signal_id_to_dial = if is_publisher {
+        None
+    } else {
+        Some(format!("{}-{}-{}", topic_gdp, connection.publisher, connection.subscriber))
+    };
+    (my_signal_id, signal_id_to_dial)
+}
 
-    let (host, port) = get_redis_address_and_port();
-    let pubsub = client::pubsub_connect(host, port)
-        .await
-        .expect("Cannot connect to Redis pubsub");
+/// Establish a WebRTC connection and set up ROS forwarding.
+/// Returns a shutdown channel to control the connection lifecycle.
+async fn establish_connection(
+    connection: Connection,
+    topic_name: &str,
+    topic_type: &str,
+    certificate: &[u8],
+    my_gdp_name: GDPName,
+    topic_gdp: GDPName,
+) -> broadcast::Sender<()> {
+    info!(
+        "Establishing connection in {} (gdp {}): {}",
+        topic_name, topic_gdp, connection.to_string()
+    );
 
-    let keyspace_topic = format!("__keyspace@0__:{}", list_key);
-    let mut stream = pubsub
-        .psubscribe(&keyspace_topic)
-        .await
-        .expect("Cannot subscribe");
+    let (my_signal_id, signal_id_to_dial) = generate_signal_ids(topic_gdp, &connection, my_gdp_name);
+    let is_publisher = connection.publisher == my_gdp_name;
 
-    let (tx, rx) = unbounded_channel();
-    let mut known_items = HashSet::<String>::new();
+    // Clone data needed in spawned task
+    let topic_name_owned = topic_name.to_owned();
+    let topic_type_owned = topic_type.to_owned();
+    let certificate_owned = certificate.to_vec();
 
+    // Create shutdown channel for lifecycle control
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
+    let shutdown_tx_for_webrtc = shutdown_tx.clone();
+
+    // Spawn connection setup in background
     tokio::spawn(async move {
-        loop {
-            let items = get_entity_from_database(&redis_url, &list_key).unwrap_or_default();
-
-            for item in items {
-                if known_items.insert(item.clone()) {
-                    let _ = tx.send(item);
-                }
+        info!("[Connection] Starting WebRTC setup for signal_id: {}", my_signal_id);
+        let (webrtc_stream, webrtc_shutdown) = match register_webrtc_stream(&my_signal_id, signal_id_to_dial).await {
+            (stream, shutdown) => {
+                info!("[Connection] WebRTC stream established successfully for signal_id: {}", my_signal_id);
+                (stream, shutdown)
             }
+        };
 
-            // Wait for a notification from the redis server
-            loop {
-                match stream.next().await {
-                    Some(Ok(_)) => break,
-                    Some(Err(e)) => error!("Error when waiting for redis updates: {}", e),
-                    None => (),
-                }
-            }
+        let (ros_tx, ros_rx) = unbounded_channel();
+        let (rtc_tx, rtc_rx) = unbounded_channel();
+        let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
+
+        // Forward shutdown signal to WebRTC
+        let mut shutdown_rx = shutdown_tx_for_webrtc.subscribe();
+        let webrtc_shutdown_clone = webrtc_shutdown.clone();
+        tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+            let _ = webrtc_shutdown_clone.send(());
+        });
+
+        info!("[Connection] Spawning WebRTC reader/writer for signal_id: {}", my_signal_id);
+        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
+        
+        if is_publisher {
+            info!("[Connection] Spawning ROS to network forwarder for signal_id: {}", my_signal_id);
+            tokio::spawn(ros_to_network_forwarder(
+                node_name, topic_name_owned, topic_type_owned,
+                certificate_owned, rtc_tx,
+            ));
+        } else {
+            info!("[Connection] Spawning network to ROS forwarder for signal_id: {}", my_signal_id);
+            tokio::spawn(network_to_ros_forwarder(
+                node_name, topic_name_owned, topic_type_owned,
+                certificate_owned, my_gdp_name, ros_rx,
+            ));
         }
+        
+        info!("[Connection] All tasks spawned successfully for signal_id: {}", my_signal_id);
     });
 
-    rx
+    shutdown_tx
 }
 
-// Determine if this node should publish or subscribe to remote
-// "pub" = no local publishers, so receive from remote and publish locally
-// "sub" = no local subscribers, so subscribe locally and send to remote
-// "noop" = both exist locally, no bridging needed
-/// Currently it uses cli to get the information
-/// TODO: use r2r/rcl to get the information
-async fn determine_topic_action(topic_name: String) -> String {
-    let out = Command::new("ros2")
-        .arg("topic")
-        .arg("info")
-        .arg(topic_name.as_str())
-        .output()
-        .await
-        .unwrap();
-
-    let output_str = String::from_utf8(out.stdout).unwrap();
-
-    if output_str.contains("Publisher count: 0") {
-        "pub".into()
-    } else if output_str.contains("Subscription count: 0") {
-        "sub".into()
-    } else {
-        "noop".into()
-    }
-}
-
-// Bridge between WebRTC DataStream and local ROS topic
-// action="sub": WebRTC → ros_publisher → local ROS
-// action="pub": local ROS → ros_subscriber → WebRTC
-pub async fn ros_topic_creator(
-    stream: DataStream, node_name: String, topic_name: String, topic_type: String, action: String,
-    certificate: Vec<u8>,
+/// Handle a new connection being added to Redis.
+async fn handle_connection_added(
+    connection_string: String,
+    topic_name: &str,
+    topic_type: &str,
+    certificate: &[u8],
+    topic_gdp: GDPName,
+    my_gdp_name: GDPName,
+    connections: &mut HashMap<String, broadcast::Sender<()>>,
 ) {
-    info!(
-        "topic creator for topic {}, type {}, action {}",
-        topic_name, topic_type, action
-    );
-    // ros_tx/rx: messages from WebRTC to ROS
-    // rtc_tx/rx: messages from ROS to WebRTC
-    let (ros_tx, ros_rx) = unbounded_channel();
-    let (rtc_tx, rtc_rx) = unbounded_channel();
-    tokio::spawn(webrtc_reader_and_writer(stream, ros_tx.clone(), rtc_rx));
-
-    match action.as_str() {
-        "sub" => {
-            tokio::spawn(ros_subscriber(
-                node_name,
-                topic_name,
-                topic_type,
-                certificate,
-                rtc_tx,
-            ));
-        }
-        "pub" => {
-            tokio::spawn(ros_publisher(
-                node_name,
-                topic_name,
-                topic_type,
-                certificate,
-                ros_rx,
-            ));
-        }
-        _ => panic!("unknown action"),
+    let connection = match parse_connection(&connection_string) {
+        Some(c) => c,
+        None => return,
     };
-}
 
-// This node receives from remote and publishes to local ROS
-// 1. Check Redis for existing subscribers in {topic}-sub
-// 2. For each subscriber, create WebRTC connection and listen
-// 3. Watch Redis for new subscribers and connect dynamically
-async fn create_network_to_ros_bridge(
-    topic_gdp: GDPName, topic_name: String, topic_type: String, certificate: Vec<u8>,
-) {
-    let redis_url = get_redis_url();
-    let publisher_side_gdp = generate_random_gdp_name();
-
-    let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp));
-    let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp));
-
-    let mut changes = watch_new_redis_list_items(subscriber_topic.clone()).await;
-
-    while let Some(new_subscriber) = changes.recv().await {
-        let publisher_url = format!(
-            "{},{},{}",
-            gdp_name_to_string(topic_gdp),
-            gdp_name_to_string(publisher_side_gdp),
-            new_subscriber
+    // Skip if this node is not involved
+    if !is_node_involved(&connection, my_gdp_name) {
+        info!(
+            "Skipping connection not involving this node: publisher {}, subscriber {}, me {}",
+            connection.publisher, connection.subscriber, my_gdp_name
         );
-
-        add_entity_to_database_as_transaction(&redis_url, &publisher_topic, &publisher_url)
-            .expect("Cannot add publisher entry");
-
-        let topic_name = topic_name.clone();
-        let topic_type = topic_type.clone();
-        let certificate = certificate.clone();
-
-        tokio::spawn(async move { ros_topic_creator(
-            register_webrtc_stream(&publisher_url, None).await,
-            format!("ros_manager_node_{}", rand::random::<u32>()),
-            topic_name,
-            topic_type,
-            "sub".into(),
-            certificate,
-        ).await });
+        return;
     }
+
+    let conn_id = connection_id(topic_gdp, &connection);
+    let shutdown_tx = establish_connection(
+        connection, topic_name, topic_type, certificate, my_gdp_name, topic_gdp,
+    ).await;
+    
+    connections.insert(conn_id.clone(), shutdown_tx);
+    info!("Successfully established connection: {}", conn_id);
 }
 
-// This node subscribes from local ROS and sends to remote
-// 1. Announce presence by adding GUID to Redis {topic}-sub
-// 2. Check Redis for existing publishers in {topic}-pub
-// 3. Connect to publishers with matching signaling URLs
-// 4. Watch Redis for new publishers and connect dynamically
-async fn create_ros_to_network_bridge(
-    topic_gdp: GDPName, topic_name: String, topic_type: String, certificate: Vec<u8>,
+/// Handle a connection being removed from Redis.
+fn handle_connection_removed(
+    connection_string: String,
+    topic_gdp: GDPName,
+    connections_topic: &str,
+    connections: &mut HashMap<String, broadcast::Sender<()>>,
 ) {
-    let redis_url = get_redis_url();
-    let subscriber_side_gdp = generate_random_gdp_name();
+    let connection = match parse_connection(&connection_string) {
+        Some(c) => c,
+        None => return,
+    };
 
-    let publisher_topic = format!("{}-pub", gdp_name_to_string(topic_gdp));
-    let subscriber_topic = format!("{}-sub", gdp_name_to_string(topic_gdp));
+    let conn_id = connection_id(topic_gdp, &connection);
+    if let Some(shutdown) = connections.remove(&conn_id) {
+        let _ = shutdown.send(());
+        info!("Shutdown signal sent for connection: {}", conn_id);
+    }
+    info!("Connection removed from {}: {}", connections_topic, connection_string);
+}
 
-    // Announce presence to publishers by adding GUID to {topic}-sub
-    add_entity_to_database_as_transaction(
-        &redis_url,
-        &subscriber_topic,
-        gdp_name_to_string(subscriber_side_gdp.clone()).as_str(),
-    )
-    .expect("add subscriber");
+/// Watch Redis for connection changes and manage connections for a topic.
+/// This is the main event loop that reacts to connection additions/removals.
+async fn manage_topic_connections(
+    topic_name: String, topic_type: String, certificate: Vec<u8>, my_gdp_name: GDPName,
+) {
+    let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
+    let (_, connections_key, _) = topic_redis_keys(topic_gdp);
 
-    let mut changes = watch_new_redis_list_items(publisher_topic.clone()).await;
+    info!("Managing connections for topic {} (GDP: {})", topic_name, topic_gdp);
 
-    while let Some(publisher) = changes.recv().await {
-        if !publisher.ends_with(&gdp_name_to_string(subscriber_side_gdp.clone())) {
-            continue;
+    let mut connection_changes = watch_topic_connections(topic_gdp).await;
+    let mut connections: HashMap<String, broadcast::Sender<()>> = HashMap::new();
+
+    while let Some(event) = connection_changes.recv().await {
+        match event {
+            RedisListChange::Added(connection_string) => {
+                info!("New connection detected: {}", connection_string);
+                handle_connection_added(
+                    connection_string, &topic_name, &topic_type, &certificate,
+                    topic_gdp, my_gdp_name, &mut connections,
+                ).await;
+            }
+            RedisListChange::Removed(connection_string) => {
+                handle_connection_removed(
+                    connection_string, topic_gdp, &connections_key, &mut connections,
+                );
+            }
         }
-
-        let remote = publisher
-            .split(',')
-            .skip(4)
-            .take(4)
-            .collect::<Vec<&str>>()
-            .join(",");
-
-        let my_url = format!(
-            "{},{},{}",
-            gdp_name_to_string(topic_gdp),
-            gdp_name_to_string(subscriber_side_gdp),
-            remote
-        );
-
-        let peer_url = format!(
-            "{},{},{}",
-            gdp_name_to_string(topic_gdp),
-            remote,
-            gdp_name_to_string(subscriber_side_gdp)
-        );
-
-        let topic_name = topic_name.clone();
-        let topic_type = topic_type.clone();
-        let certificate = certificate.clone();
-
-        tokio::spawn(async move {
-            ros_topic_creator(
-                register_webrtc_stream(&my_url, Some(peer_url)).await,
-                format!("ros_manager_node_{}", rand::random::<u32>()),
-                topic_name,
-                topic_type,
-                "pub".into(),
-                certificate,
-            ).await
-        });
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
-pub struct RosTopicStatus {
-    pub action: String,
+
+/// Attach this node as a subscriber with a random delay to avoid thundering herd.
+async fn attach_as_subscriber(
+    redis_url: String,
+    topic_gdp: GDPName,
+    topic_name: String,
+    my_gdp_name: GDPName,
+) {
+    // Random delay to avoid thundering herd problem
+    let delay_ms = SUBSCRIBER_ATTACH_BASE_DELAY_MS 
+        + (rand::thread_rng().gen::<u64>() % SUBSCRIBER_ATTACH_RANDOM_DELAY_MS);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    
+    let (publishers_key, connections_key, proxy_key) = topic_redis_keys(topic_gdp);
+    if !attach_subscriber(
+        &redis_url,
+        &connections_key,
+        &publishers_key,
+        &proxy_key,
+        &topic_name,
+        my_gdp_name,
+    ) {
+        error!("Failed to attach as subscriber for topic {}", topic_name);
+    }
 }
 
-// Main entry point: manages distributed ROS topic bridging
-// 1. Reads config for topics to bridge
-// 2. Spawns publisher/subscriber handlers for each topic
-// 3. Optionally auto-discovers new topics every 5s
-pub async fn ros_topic_manager() {
-    let config = AppConfig::fetch().unwrap();
+/// Setup a topic: spawn connection watcher and register role.
+fn setup_topic(
+    topic_name: String,
+    topic_type: String,
+    topic_action: String,
+    certificate: Vec<u8>,
+    my_gdp_name: GDPName,
+    redis_url: String,
+) {
+    let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
+    
+    // Always spawn connection manager to react to connection changes
+    tokio::spawn(manage_topic_connections(
+        topic_name.clone(), topic_type.clone(), certificate.clone(), my_gdp_name,
+    ));
+
+    // Register role based on action
+    match topic_action.as_str() {
+        "pub" => {
+            if let Err(e) = register_publisher(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
+                error!("Error registering as publisher: {}", e);
+            }
+        }
+        "sub" => {
+            tokio::spawn(attach_as_subscriber(
+                redis_url.clone(), topic_gdp, topic_name.clone(), my_gdp_name,
+            ));
+        }
+        "proxy" => {
+            if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
+                error!("Error registering as proxy: {}", e);
+            }
+        }
+        "noop" => {}
+        action => error!("Unknown action '{}' for topic {}", action, topic_name),
+    }
+}
+
+pub async fn ros_topic_discovery() {
+    let config = AppConfig::fetch().unwrap_or_else(|e| {
+        error!("Failed to fetch app config: {}", e);
+        std::process::exit(1);
+    });
+
     let certificate = std::fs::read(format!(
         "./scripts/crypto/{}/{}-private.pem",
         config.crypto_name, config.crypto_name
     ))
-    .expect("crypto file missing");
+    .unwrap_or_else(|e| {
+        error!(
+            "Failed to read certificate file for crypto_name '{}': {}",
+            config.crypto_name, e
+        );
+        std::process::exit(1);
+    });
 
-    let ctx = r2r::Context::create().unwrap();
-    let node = r2r::Node::create(ctx, "ros_manager", "namespace").unwrap();
+    let ctx = r2r::Context::create().unwrap_or_else(|e| {
+        error!("Failed to create ROS context: {}", e);
+        std::process::exit(1);
+    });
+    let _node = r2r::Node::create(ctx, "ros_manager", "namespace").unwrap_or_else(|e| {
+        error!("Failed to create ROS node: {}", e);
+        std::process::exit(1);
+    });
+    let my_gdp_name = generate_random_gdp_name();
 
-    // Automatic topic discovery loop (polls every 5s)
-    // When a new topic is detected, create a new thread to handle the topic
-    let mut topic_status = HashMap::<String, RosTopicStatus>::new();
+    info!("My GDP name is: {}", my_gdp_name.to_string());
+
+    let redis_url = get_redis_url();
+    
+    // Publish GDP name -> Docker container name mapping
+    let container_name = crate::db::get_container_name();
+    if let Err(e) = crate::db::publish_gdp_name_mapping(&redis_url, my_gdp_name, &container_name) {
+        error!("Failed to publish GDP name mapping: {}", e);
+    } else {
+        info!("Published GDP name mapping: {} -> {}", my_gdp_name.to_string(), container_name);
+    }
+    
+    info!("Node {} ({}) registered but not yet connected to any topics", my_gdp_name.to_string(), container_name);
+
+    // Setup each topic: spawn watcher and register role
+    for topic in config.ros {
+        setup_topic(
+            topic.topic_name.clone(),
+            topic.topic_type.clone(),
+            topic.action.clone(),
+            certificate.clone(),
+            my_gdp_name,
+            redis_url.clone(),
+        );
+    }
+
     loop {
-        sleep(Duration::from_millis(5000)).await;
-
-        let current = node.get_topic_names_and_types().unwrap();
-
-        for (topic, types) in current {
-            if topic_status.contains_key(&topic) {
-                continue;
-            }
-
-            let tname = topic.clone();
-            let ttype = types[0].clone();
-            let action = determine_topic_action(tname.clone()).await;
-
-            let gdp = GDPName(get_gdp_name_from_topic(&tname, &ttype, &certificate));
-
-            topic_status.insert(
-                tname.clone(),
-                RosTopicStatus {
-                    action: action.clone(),
-                },
-            );
-
-            match action.as_str() {
-                "sub" => {
-                    tokio::spawn(create_network_to_ros_bridge(
-                        gdp.clone(),
-                        tname,
-                        ttype,
-                        certificate.clone(),
-                    ));
-                }
-                "pub" => {
-                    tokio::spawn(create_ros_to_network_bridge(
-                        gdp.clone(),
-                        tname,
-                        ttype,
-                        certificate.clone(),
-                    ));
-                }
-                _ => {}
-            }
-        }
+        tokio::time::sleep(Duration::from_millis(MAIN_LOOP_SLEEP_MS)).await;
     }
 }

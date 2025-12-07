@@ -1,9 +1,7 @@
 extern crate tokio;
 extern crate tokio_core;
 
-use crate::topic_manager::ros_topic_manager;
-use futures::future;
-
+use crate::topic_manager::ros_topic_discovery;
 use utils::app_config::AppConfig;
 use utils::error::Result;
 
@@ -13,12 +11,7 @@ use utils::error::Result;
 async fn router_async_loop() {
     let config = AppConfig::fetch().expect("App config unable to load");
     info!("{:#?}", config);
-    let mut future_handles = Vec::new();
-
-    let ros_topic_manager_handle = tokio::spawn(ros_topic_manager());
-    future_handles.push(ros_topic_manager_handle);
-
-    future::join_all(future_handles).await;
+    ros_topic_discovery().await;
 }
 
 /// Show the configuration file

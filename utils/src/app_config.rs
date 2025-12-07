@@ -19,7 +19,7 @@ pub struct Database {
     pub url: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ROS {
     pub action: String,
     pub topic_name: String,

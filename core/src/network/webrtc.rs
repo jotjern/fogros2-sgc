@@ -1,4 +1,7 @@
+use std::collections::VecDeque;
+use std::fs::File;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::pipeline::construct_gdp_forward_from_bytes;
 use crate::structs::GDPHeaderInTransit;
@@ -14,9 +17,10 @@ use futures::{
     io::{AsyncReadExt, AsyncWriteExt},
     SinkExt, StreamExt,
 };
+use tokio::sync::broadcast;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info, warn};
+use log::{error, info, warn};
 use utils::app_config::AppConfig;
 
 // Buffer size for receiving WebRTC data chunks (1.7MB)
@@ -57,19 +61,26 @@ pub fn parse_header_payload_pairs(
         // Split buffer at first null byte: [header]\0[payload + rest]
         let header_and_remaining = buffer.splitn(2, |c| c == &0).collect::<Vec<_>>();
         let header_buf = header_and_remaining[0];
-        let header: &str = std::str::from_utf8(header_buf).unwrap();
+        let header: &str = match std::str::from_utf8(header_buf) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to parse header as UTF-8: {}", e);
+                continue;
+            }
+        };
         info!("received header json string: {:?}", header);
         
         // Try parsing JSON header
-        let gdp_header_parsed = serde_json::from_str::<GDPHeaderInTransit>(header);
-        if gdp_header_parsed.is_err() {
-            warn!("header is not complete, return the remaining");
-            return (
-                header_payload_pairs,
-                Some((default_gdp_header, header_buf.to_vec())),
-            );
-        }
-        let gdp_header = gdp_header_parsed.unwrap();
+        let gdp_header = match serde_json::from_str::<GDPHeaderInTransit>(header) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Header parsing failed (may be incomplete): {}, returning remaining buffer", e);
+                return (
+                    header_payload_pairs,
+                    Some((default_gdp_header, header_buf.to_vec())),
+                );
+            }
+        };
         let remaining = header_and_remaining[1];
 
         // Check if we have enough data for the payload
@@ -117,26 +128,57 @@ struct SignalingMessage {
 /// - `peer_to_dial`: If Some, initiates connection; if None, waits for incoming connection
 ///
 /// # Returns
-/// An established WebRTC DataStream for bidirectional communication
-pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -> DataStream {
-    let config = AppConfig::fetch().expect("Failed to fetch config");
+/// An established WebRTC DataStream for bidirectional communication, plus a shutdown signal
+/// that cleanly stops signaling tasks (useful when reconnecting with the same ID).
+pub async fn register_webrtc_stream(
+    my_id: &str,
+    peer_to_dial: Option<String>,
+) -> (DataStream, broadcast::Sender<()>) {
+    info!("[WebRTC] Starting WebRTC connection setup for signal_id: {}", my_id);
+    info!("[WebRTC] Connection mode: {}", if peer_to_dial.is_some() { "initiator (dialing)" } else { "responder (accepting)" });
+    
+    // Own my_id so it can be moved into spawned tasks safely
+    let my_id = my_id.to_string();
+    let config = AppConfig::fetch().unwrap_or_else(|e| {
+        error!("[WebRTC] Failed to fetch config: {}", e);
+        panic!("Cannot proceed without config");
+    });
     
     // Configure WebRTC with Google's public STUN server for NAT traversal
     let ice_servers = vec!["stun:stun.l.google.com:19302"];
+    info!("[WebRTC] Configuring RTC with STUN server: {:?}", ice_servers);
     let conf = RtcConfig::new(&ice_servers);
     
     // Set up channels for signaling messages (SDP/ICE exchange)
     // These channels allow the PeerConnection instance to communicate signaling data to and from the WebSocket signaling server.
     let (tx_sig_outbound, mut rx_sig_outbound) = mpsc::channel(32);
     let (mut tx_sig_inbound, rx_sig_inbound) = mpsc::channel(32);
-    let listener = PeerConnection::new(&conf, (tx_sig_outbound, rx_sig_inbound)).unwrap();
+    
+    info!("[WebRTC] Creating PeerConnection for signal_id: {}", my_id);
+    let listener = PeerConnection::new(&conf, (tx_sig_outbound, rx_sig_inbound)).unwrap_or_else(|e| {
+        error!("[WebRTC] Failed to create PeerConnection for {}: {:?}", my_id, e);
+        panic!("PeerConnection creation failed");
+    });
+    info!("[WebRTC] PeerConnection created successfully for {}", my_id);
+    
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Connect to signaling server via WebSocket
     let signaling_uri = config.signaling_server_address;
     let signaling_uri = format!("{}/{}", signaling_uri, my_id);
-    info!("The signaling URI is {}", signaling_uri);
+    info!("[WebRTC] Connecting to signaling server: {}", signaling_uri);
 
-    let (mut write, mut read) = connect_async(&signaling_uri).await.unwrap().0.split();
+    let (mut write, mut read) = match connect_async(&signaling_uri).await {
+        Ok(ws_stream) => {
+            info!("[WebRTC] Successfully connected to signaling server: {}", signaling_uri);
+            ws_stream.0.split()
+        }
+        Err(e) => {
+            error!("[WebRTC] Failed to connect to signaling server {}: {:?}", signaling_uri, e);
+            error!("[WebRTC] WebRTC connection setup failed for signal_id: {}", my_id);
+            panic!("Signaling server connection failed: {:?}", e);
+        }
+    };
     let other_peer = Arc::new(Mutex::new(peer_to_dial.clone()));
     let other_peer_c = other_peer.clone();
     
@@ -146,19 +188,45 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     // specifying the intended peer's ID, serializes it to JSON, and sends it over the
     // WebSocket connection to the signaling server, which relays it to the remote peer.
     // If sending fails, an error is logged and the loop breaks.
+    let mut shutdown_rx_w = shutdown_rx.resubscribe();
+    let my_id_write = my_id.clone();
     let f_write = async move {
-        while let Some(m) = rx_sig_outbound.next().await {
-            let m = SignalingMessage {
-                payload: m,
-                id: other_peer_c.lock().as_ref().cloned().unwrap(),
-            };
-            let s = serde_json::to_string(&m).unwrap();
-            info!("Sending {:?}", s);
-            match write.send(tungstenite::Message::text(s)).await {
-                Ok(_) => (),
-                Err(e) => {
-                    error!("Error sending {:?}", e);
+        let mut pending: VecDeque<Message> = VecDeque::new();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx_w.recv() => {
+                    info!("Stopping signaling writer for {}", my_id_write);
                     break;
+                }
+                Some(m) = rx_sig_outbound.next() => {
+                    pending.push_back(m);
+                }
+                else => break,
+            }
+            // Only send when we know the remote peer id.
+            if pending.is_empty() {
+                continue;
+            }
+            let Some(peer_id) = other_peer_c.lock().as_ref().cloned() else {
+                warn!("Signaling peer id unknown; buffering {} messages", pending.len());
+                continue;
+            };
+            while let Some(msg) = pending.pop_front() {
+                let m = SignalingMessage {
+                    payload: msg,
+                    id: peer_id.clone(),
+                };
+                let s = serde_json::to_string(&m).unwrap();
+                info!("[WebRTC] Sending signaling message to peer {}: {} bytes", peer_id, s.len());
+                match write.send(tungstenite::Message::text(s)).await {
+                    Ok(_) => {
+                        info!("[WebRTC] Successfully sent signaling message to peer {}", peer_id);
+                    }
+                    Err(e) => {
+                        error!("[WebRTC] Failed to send signaling message to peer {}: {:?}", peer_id, e);
+                        error!("[WebRTC] Signaling writer task exiting due to send error");
+                        break;
+                    }
                 }
             }
         }
@@ -168,25 +236,76 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     
     // Task: Receive inbound signaling messages from peer via signaling server
     // Similar to the f_write task above
+    let mut shutdown_rx_r = shutdown_rx.resubscribe();
+    let my_id_read = my_id.clone();
     let f_read = async move {
-        while let Some(Ok(m)) = read.next().await {
-            info!("received {:?}", m);
-            if let Some(val) = match m {
-                tungstenite::Message::Text(t) => {
-                    Some(serde_json::from_str::<serde_json::Value>(&t).unwrap())
+        loop {
+            tokio::select! {
+                _ = shutdown_rx_r.recv() => {
+                    info!("Stopping signaling reader for {}", my_id_read);
+                    break;
                 }
-                tungstenite::Message::Binary(b) => Some(serde_json::from_slice(&b[..]).unwrap()),
-                tungstenite::Message::Close(e) => {
-                    warn!("close message {:?}", e);
-                    continue;
-                }
-                _ => None,
-            } {
-                let c: SignalingMessage = serde_json::from_value(val).unwrap();
-                info!("msg {:?}", c);
-                other_peer.lock().replace(c.id);
-                if tx_sig_inbound.send(c.payload).await.is_err() {
-                    panic!()
+                maybe_msg = read.next() => {
+                    match maybe_msg {
+                        Some(Ok(m)) => {
+                            info!("[WebRTC] Received signaling message: type={:?}, size={}", 
+                                m, match &m {
+                                    tungstenite::Message::Text(t) => t.len(),
+                                    tungstenite::Message::Binary(b) => b.len(),
+                                    _ => 0,
+                                });
+                            if let Some(val) = match m {
+                                tungstenite::Message::Text(t) => {
+                                    match serde_json::from_str::<serde_json::Value>(&t) {
+                                        Ok(v) => Some(v),
+                                        Err(e) => {
+                                            error!("[WebRTC] Failed to parse text signaling message: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                tungstenite::Message::Binary(b) => {
+                                    match serde_json::from_slice(&b[..]) {
+                                        Ok(v) => Some(v),
+                                        Err(e) => {
+                                            error!("[WebRTC] Failed to parse binary signaling message: {}", e);
+                                            continue;
+                                        }
+                                    }
+                                }
+                                tungstenite::Message::Close(e) => {
+                                    warn!("[WebRTC] Received close message from signaling server: {:?}", e);
+                                    error!("[WebRTC] Signaling server closed connection for {}", my_id_read);
+                                    break;
+                                }
+                                _ => None,
+                            } {
+                                match serde_json::from_value::<SignalingMessage>(val) {
+                                    Ok(c) => {
+                                        info!("[WebRTC] Parsed signaling message from peer: {}", c.id);
+                                        other_peer.lock().replace(c.id.clone());
+                                        if tx_sig_inbound.send(c.payload).await.is_err() {
+                                            error!("[WebRTC] Failed to forward signaling message to PeerConnection (channel closed)");
+                                            break;
+                                        }
+                                        info!("[WebRTC] Successfully forwarded signaling message to PeerConnection");
+                                    }
+                                    Err(e) => {
+                                        error!("[WebRTC] Failed to deserialize SignalingMessage: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => {
+                            error!("[WebRTC] Error reading from signaling server: {:?}", e);
+                            error!("[WebRTC] Signaling reader task exiting due to read error");
+                            break;
+                        }
+                        None => {
+                            warn!("[WebRTC] Signaling server stream ended (None received)");
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -194,22 +313,41 @@ pub async fn register_webrtc_stream(my_id: &str, peer_to_dial: Option<String>) -
     };
 
     tokio::spawn(f_read);
-    
+
     // Establish the data channel connection
-    let stream = if peer_to_dial.is_some() {
+    info!("[WebRTC] Establishing data channel for signal_id: {}", my_id);
+    let stream = if let Some(peer_id) = peer_to_dial {
         // We are the initiator: dial the peer
-        info!("dialing");
-        let dc = listener.dial("whatever").await.unwrap();
-        info!("dial succeed");
-        dc
+        info!("[WebRTC] Initiating connection to peer: {}", peer_id);
+        match listener.dial("whatever").await {
+            Ok(dc) => {
+                info!("[WebRTC] Successfully dialed peer {} for signal_id {}", peer_id, my_id);
+                dc
+            }
+            Err(e) => {
+                error!("[WebRTC] Failed to dial peer {} for signal_id {}: {:?}", peer_id, my_id, e);
+                error!("[WebRTC] WebRTC connection establishment failed");
+                panic!("Data channel dial failed: {:?}", e);
+            }
+        }
     } else {
         // We are the responder: accept incoming connection
-        info!("accepting");
-        let dc = listener.accept().await.unwrap();
-        info!("accept succeed");
-        dc
+        info!("[WebRTC] Waiting to accept incoming connection for signal_id: {}", my_id);
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        match listener.accept().await {
+            Ok(dc) => {
+                info!("[WebRTC] Successfully accepted connection for signal_id: {}", my_id);
+                dc
+            }
+            Err(e) => {
+                error!("[WebRTC] Failed to accept connection for signal_id {}: {:?}", my_id, e);
+                error!("[WebRTC] WebRTC connection establishment failed");
+                panic!("Data channel accept failed: {:?}", e);
+            }
+        }
     };
-    stream
+    info!("[WebRTC] WebRTC data channel established successfully for signal_id: {}", my_id);
+    (stream, shutdown_tx)
 }
 
 // ============================================================================
@@ -233,7 +371,11 @@ pub async fn webrtc_reader_and_writer(
     ros_tx: UnboundedSender<GDPPacket>,       // Send parsed packets to ROS
     mut rtc_rx: UnboundedReceiver<GDPPacket>, // Receive packets from ROS to forward
 ) {
+    info!("[WebRTC] Starting reader/writer task");
     let thread_name: GDPName = generate_random_gdp_name();
+    let mut outbound_closed = false;
+    let mut packets_received = 0u64;
+    let mut packets_sent = 0u64;
     
     // State for reassembling fragmented packets
     let mut need_more_data_for_previous_header = false;
@@ -255,9 +397,23 @@ pub async fn webrtc_reader_and_writer(
             // ========================================
             // RECEIVE: WebRTC → ROS
             // ========================================
-            Ok(receiving_buf_size) = stream.read(&mut receiving_buf) => {
+            read_res = stream.read(&mut receiving_buf) => {
+                let receiving_buf_size = match read_res {
+                    Ok(sz) => {
+                        if sz == 0 {
+                            warn!("[WebRTC] Read 0 bytes - connection may be closed");
+                            break;
+                        }
+                        sz
+                    }
+                    Err(e) => {
+                        error!("[WebRTC] Connection error during read: {}", e);
+                        error!("[WebRTC] WebRTC stream read failed - connection closed");
+                        break;
+                    }
+                };
                 let mut receiving_buf = receiving_buf[..receiving_buf_size].to_vec();
-                info!("read {} bytes", receiving_buf_size);
+                info!("[WebRTC] Read {} bytes from data channel", receiving_buf_size);
 
                 let mut header_payload_pair = vec!();
 
@@ -310,24 +466,30 @@ pub async fn webrtc_reader_and_writer(
                 
                 // Forward all complete packets to ROS
                 for (header, payload) in header_payload_pair {
-                    let deserialized = header; //TODO: change the var name here
+                    let deserialized = header;
 
-                    info!("the total received payload with size {:} with gdp header length {}",  payload.len(), header.length);
+                    info!("[WebRTC] Parsed packet: action={:?}, destination={}, payload_size={}, header_length={}", 
+                        deserialized.action, deserialized.destination, payload.len(), header.length);
 
                     if deserialized.action == GdpAction::Forward {
+                        packets_received += 1;
+                        info!("[WebRTC] Received Forward packet #{}: destination={}, payload_size={}", 
+                            packets_received, deserialized.destination, payload.len());
                         let packet = construct_gdp_forward_from_bytes(deserialized.destination, thread_name, payload);
-                        ros_tx.send(packet).unwrap();
-                        // proc_gdp_packet(packet,  // packet
-                        //     &fib_tx,  //used to send packet to fib
-                        //     &channel_tx, // used to send GDPChannel to fib
-                        //     &m_tx, //the sending handle of this connection
-                        //     &rib_query_tx,
-                        //     "".to_string(),
-                        // ).await;
-                        info!("todo to be forwarded");
-                    }
-                    else{
-                        info!("TCP received a packet but did not handle: {:?}", deserialized)
+                        match ros_tx.send(packet) {
+                            Ok(_) => {
+                                info!("[WebRTC] Successfully forwarded packet #{} to ROS (destination: {})", 
+                                    packets_received, deserialized.destination);
+                            }
+                            Err(e) => {
+                                error!("[WebRTC] ROS receiver channel closed, discarding inbound packet #{}: {}", 
+                                    packets_received, e);
+                                error!("[WebRTC] Cannot forward packet - ROS receiver unavailable");
+                                error!("[WebRTC] Total packets received before failure: {}", packets_received);
+                            }
+                        }
+                    } else {
+                        info!("[WebRTC] Received non-Forward packet (action: {:?}), not forwarding", deserialized.action);
                     }
                 }
 
@@ -348,37 +510,71 @@ pub async fn webrtc_reader_and_writer(
             // ========================================
             // SEND: ROS → WebRTC
             // ========================================
-            Some(pkt_to_forward) = rtc_rx.recv() => {
+            maybe_pkt_to_forward = rtc_rx.recv(), if !outbound_closed => {
+                let Some(pkt_to_forward) = maybe_pkt_to_forward else {
+                    info!("[WebRTC] ROS sender channel closed, stopping outbound forwarding");
+                    outbound_closed = true;
+                    continue;
+                };
+                packets_sent += 1;
                 let transit_header = pkt_to_forward.get_header();
                 let mut header_string = serde_json::to_string(&transit_header).unwrap();
-                info!("the header size is {}", header_string.len());
-                info!("the header to sent is {}", header_string);
+                info!("[WebRTC] Preparing to send packet #{}: header_size={}, destination={}, action={:?}", 
+                    packets_sent, header_string.len(), transit_header.destination, transit_header.action);
 
                 //insert the first null byte to separate the packet header
                 header_string.push(0u8 as char);
                 let header_string_payload = header_string.as_bytes();
-                match stream.write_all(&header_string_payload[..header_string_payload.len()]).await {
-                    Ok(_) => {},
+                match stream.write_all(header_string_payload).await {
+                    Ok(_) => {
+                        info!("[WebRTC] Successfully wrote header: {} bytes", header_string_payload.len());
+                    }
                     Err(e) => {
-                        warn!("Connection closed during write: {}", e);
+                        error!("[WebRTC] Connection error during header write: {}", e);
+                        error!("[WebRTC] WebRTC stream write failed - connection closed");
                         break;
                     }
                 }
 
                 // Write payload if present
                 if let Some(payload) = pkt_to_forward.payload {
-                    info!("Writing payload: {} bytes", payload.len());
-                    stream.write_all(&payload).await.unwrap();
+                    info!("[WebRTC] Writing payload: {} bytes", payload.len());
+                    match stream.write_all(&payload).await {
+                        Ok(_) => {
+                            info!("[WebRTC] Successfully wrote payload: {} bytes", payload.len());
+                        }
+                        Err(e) => {
+                            error!("[WebRTC] Connection error during payload write: {}", e);
+                            error!("[WebRTC] WebRTC stream write failed - connection closed");
+                            break;
+                        }
+                    }
                 }
 
                 // Write name record if present
                 if let Some(name_record) = pkt_to_forward.name_record {
                     let name_record_string = serde_json::to_string(&name_record).unwrap();
                     let name_record_bytes = name_record_string.as_bytes();
-                    info!("Writing name record: {} bytes", name_record_bytes.len());
-                    stream.write_all(name_record_bytes).await.unwrap();
+                    info!("[WebRTC] Writing name record: {} bytes", name_record_bytes.len());
+                    match stream.write_all(name_record_bytes).await {
+                        Ok(_) => {
+                            info!("[WebRTC] Successfully wrote name record: {} bytes", name_record_bytes.len());
+                        }
+                        Err(e) => {
+                            error!("[WebRTC] Connection error during name record write: {}", e);
+                            error!("[WebRTC] WebRTC stream write failed - connection closed");
+                            break;
+                        }
+                    }
                 }
             }
         }
+    }
+    
+    // Log final statistics when loop exits
+    error!("[WebRTC] Reader/writer task exiting. Stats: packets_received={}, packets_sent={}, outbound_closed={}", 
+        packets_received, packets_sent, outbound_closed);
+    if packets_received == 0 && packets_sent == 0 {
+        warn!("[WebRTC] No packets were processed - connection may have failed immediately");
     }
 }

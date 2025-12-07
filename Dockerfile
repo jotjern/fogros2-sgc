@@ -29,9 +29,6 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 # RUN . /opt/ros/humble/setup.sh cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
-# generate crypto keys
-WORKDIR /app/scripts
-RUN bash ./generate_crypto.sh
 # build app
 WORKDIR /app
 # Build everything (debug or release)

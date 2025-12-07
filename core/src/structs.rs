@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Result};
 use rand::Rng;
 use std::fmt;
+use std::num::ParseIntError;
+use std::str::FromStr;
 use strum_macros::EnumIter;
 use tokio::sync::mpsc::UnboundedSender;
 pub const MAGIC_NUMBERS: u16 = u16::from_be_bytes([0x26, 0x2a]);
@@ -66,7 +68,26 @@ impl From<u16be> for u16 {
 pub struct GDPName(pub [u8; 4]);
 impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(
+            f,
+            "{:02x}{:02x}{:02x}{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3]
+        )?;
+        Ok(())
+    }
+}
+
+impl FromStr for GDPName {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let mut bytes = [0u8; 4];
+        for (i, chunk) in s.as_bytes().chunks(2).take(4).enumerate() {
+            if let Ok(chunk_str) = std::str::from_utf8(chunk) {
+                bytes[i] = u8::from_str_radix(chunk_str, 16)?;
+            }
+        }
+        Ok(GDPName(bytes))
     }
 }
 
@@ -111,10 +132,7 @@ pub struct GDPHeaderInTransit {
 
 impl Packet for GDPPacket {
     fn get_byte_payload(&self) -> Option<&Vec<u8>> {
-        match &self.payload {
-            Some(p) => Some(p),
-            None => None, // TODO
-        }
+        self.payload.as_ref()
     }
 
     fn get_header(&self) -> GDPHeaderInTransit {
@@ -234,13 +252,42 @@ pub struct GDPStatus {
 
 // Convert GDPName to comma-separated string for Redis keys (e.g., "167,229,32,134")
 pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
-    format!("{},{},{},{}", name[0], name[1], name[2], name[3])
+    format!("{:x}{:x}{:x}{:x}", name[0], name[1], name[2], name[3])
 }
 
-pub fn string_to_gdp_name(name: &str) -> GDPName {
-    let mut bytes = [0u8; 4];
-    for (i, byte) in name.as_bytes().chunks(2).enumerate() {
-        bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16).unwrap();
+pub struct Connection {
+  pub publisher: GDPName,
+  pub subscriber: GDPName
+}
+
+impl ToString for Connection {
+    fn to_string(&self) -> String {
+      format!("{}-{}", self.publisher, self.subscriber)
     }
-    GDPName(bytes)
+}
+
+impl FromStr for Connection {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+      let mut parts = s.split("-");
+
+      let publisher_str = parts.next()
+          .ok_or_else(|| "invalid".parse::<i32>().unwrap_err())?;
+      let subscriber_str = parts.next()
+          .ok_or_else(|| "invalid".parse::<i32>().unwrap_err())?;
+
+      // Check for extra parts
+      if parts.next().is_some() {
+          return Err("invalid".parse::<i32>().unwrap_err());
+      }
+
+      let publisher = GDPName::from_str(publisher_str)?;
+      let subscriber = GDPName::from_str(subscriber_str)?;
+
+      Ok(Connection {
+        publisher,
+        subscriber
+      })
+    }
 }

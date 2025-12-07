@@ -235,13 +235,17 @@ pub fn attach_subscriber(
         }
     };
 
-    // If parent has mixed children (proxies and subscribers), find a proxy to take over
-    if has_mixed_children(&parent, &proxies, &connections) {
-        info!("Parent {} has mixed children, finding proxy to take over (topic: {})", parent, topic_name);
+    // Only reorganize if parent is at capacity AND has mixed children
+    // This ensures we only introduce proxies when necessary (at max children limit)
+    let parent_children = connections.get(&parent).cloned().unwrap_or_default();
+    let parent_load = parent_children.len();
+    
+    if parent_load >= MAX_CHILDREN && has_mixed_children(&parent, &proxies, &connections) {
+        info!("Parent {} is at capacity ({}/{}) with mixed children, finding proxy to take over (topic: {})", 
+            parent, parent_load, MAX_CHILDREN, topic_name);
         
         // Find an available proxy that can take all children
-        let children = connections.get(&parent).cloned().unwrap_or_default();
-        let total_children = children.len();
+        let total_children = parent_children.len();
         
         // Look for a proxy with enough capacity to take all children
         let candidate_proxy = proxies.iter()
@@ -275,14 +279,14 @@ pub fn attach_subscriber(
             
             // Move all children to the proxy
             if let Err(e) = move_children_to_new_parent(
-                redis_url, connections_key, parent, proxy, &children,
+                redis_url, connections_key, parent, proxy, &parent_children,
             ) {
                 error!("Failed to move children from {} to {}: {}", parent, proxy, e);
                 return false;
             }
             
             info!("Moved {} children from {} to proxy {} (topic: {})", 
-                children.len(), parent, proxy, topic_name);
+                parent_children.len(), parent, proxy, topic_name);
             
             // Reload connections after moving
             connections = match build_connections_map(redis_url, connections_key) {
@@ -296,7 +300,7 @@ pub fn attach_subscriber(
             parent = proxy;
         } else {
             // No suitable proxy found - this is a problem, but we'll proceed with warning
-            warn!("Parent {} has mixed children but no suitable proxy found to take over (topic: {})", 
+            warn!("Parent {} is at capacity with mixed children but no suitable proxy found to take over (topic: {})", 
                 parent, topic_name);
         }
     }

@@ -9,6 +9,7 @@ pub mod structs;
 pub mod rib;
 // network processing
 pub mod connection_fib;
+pub mod connection_store;
 pub mod db;
 pub mod pipeline;
 // util

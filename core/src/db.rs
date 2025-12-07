@@ -185,3 +185,30 @@ pub async fn watch_redis_list_items(list_key: String) -> UnboundedReceiver<Redis
 
     rx
 }
+
+/// Register a GDP name as a publisher for a topic in Redis.
+pub fn register_publisher(
+    redis_url: &str,
+    topic_gdp: crate::structs::GDPName,
+    gdp_name: crate::structs::GDPName,
+    topic_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let publishers_key = format!("{}-publishers", topic_gdp);
+    add_entity_to_database_as_transaction(redis_url, &publishers_key, &gdp_name.to_string())
+        .map_err(|e| format!("Failed to register as publisher: {}", e))?;
+    info!("Registered as publisher for topic: {} (GDP: {})", topic_name, topic_gdp);
+    Ok(())
+}
+
+/// Register a GDP name as a proxy for a topic in Redis.
+pub fn register_proxy(
+    redis_url: &str,
+    topic_gdp: crate::structs::GDPName,
+    gdp_name: crate::structs::GDPName,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let proxy_key = format!("{}-proxies", topic_gdp);
+    add_entity_to_database_as_transaction(redis_url, &proxy_key, &gdp_name.to_string())
+        .map_err(|e| format!("Failed to register as proxy: {}", e))?;
+    info!("Registered as proxy (GDP: {})", gdp_name);
+    Ok(())
+}

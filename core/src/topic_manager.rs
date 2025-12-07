@@ -1,16 +1,15 @@
+use crate::connection_store::{connection_id, is_node_involved, parse_connection, topic_redis_keys, watch_topic_connections};
+use crate::db::{get_redis_url, register_proxy, register_publisher, RedisListChange};
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
 use crate::routing::attach_subscriber;
 use crate::structs::{Connection, GDPName, generate_random_gdp_name, get_gdp_name_from_topic};
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use rand::Rng;
 use tokio::sync::{broadcast, mpsc::unbounded_channel};
 use tokio::time::Duration;
 use utils::app_config::AppConfig;
-
-use crate::db::*;
 
 // Constants for timing and delays
 const SUBSCRIBER_ATTACH_BASE_DELAY_MS: u64 = 2000;
@@ -98,14 +97,6 @@ async fn establish_connection(
     shutdown_tx
 }
 
-/// Parse connection string, returning None on error.
-fn parse_connection(connection_string: &str) -> Option<Connection> {
-    Connection::from_str(connection_string).map_err(|e| {
-        error!("Failed to parse connection {}: {:?}", connection_string, e);
-        e
-    }).ok()
-}
-
 /// Handle a new connection being added to Redis.
 async fn handle_connection_added(
     connection_string: String,
@@ -122,7 +113,7 @@ async fn handle_connection_added(
     };
 
     // Skip if this node is not involved
-    if connection.publisher != my_gdp_name && connection.subscriber != my_gdp_name {
+    if !is_node_involved(&connection, my_gdp_name) {
         info!(
             "Skipping connection not involving this node: publisher {}, subscriber {}, me {}",
             connection.publisher, connection.subscriber, my_gdp_name
@@ -130,13 +121,13 @@ async fn handle_connection_added(
         return;
     }
 
-    let connection_id = format!("{}-{}", topic_gdp, connection.to_string());
+    let conn_id = connection_id(topic_gdp, &connection);
     let shutdown_tx = establish_connection(
         connection, topic_name, topic_type, certificate, my_gdp_name, topic_gdp,
     ).await;
     
-    connections.insert(connection_id.clone(), shutdown_tx);
-    info!("Successfully established connection: {}", connection_id);
+    connections.insert(conn_id.clone(), shutdown_tx);
+    info!("Successfully established connection: {}", conn_id);
 }
 
 /// Handle a connection being removed from Redis.
@@ -151,25 +142,25 @@ fn handle_connection_removed(
         None => return,
     };
 
-    let connection_id = format!("{}-{}", topic_gdp, connection.to_string());
-    if let Some(shutdown) = connections.remove(&connection_id) {
+    let conn_id = connection_id(topic_gdp, &connection);
+    if let Some(shutdown) = connections.remove(&conn_id) {
         let _ = shutdown.send(());
-        info!("Shutdown signal sent for connection: {}", connection_id);
+        info!("Shutdown signal sent for connection: {}", conn_id);
     }
     info!("Connection removed from {}: {}", connections_topic, connection_string);
 }
 
 /// Watch Redis for connection changes and manage connections for a topic.
 /// This is the main event loop that reacts to connection additions/removals.
-async fn watch_topic_connections(
+async fn manage_topic_connections(
     topic_name: String, topic_type: String, certificate: Vec<u8>, my_gdp_name: GDPName,
 ) {
     let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
-    let connections_topic = format!("{}-connections", topic_gdp);
+    let (_, connections_key, _) = topic_redis_keys(topic_gdp);
 
-    info!("Watching connections for topic {} (GDP: {})", topic_name, topic_gdp);
+    info!("Managing connections for topic {} (GDP: {})", topic_name, topic_gdp);
 
-    let mut connection_changes = watch_redis_list_items(connections_topic.clone()).await;
+    let mut connection_changes = watch_topic_connections(topic_gdp).await;
     let mut connections: HashMap<String, broadcast::Sender<()>> = HashMap::new();
 
     while let Some(event) = connection_changes.recv().await {
@@ -183,46 +174,18 @@ async fn watch_topic_connections(
             }
             RedisListChange::Removed(connection_string) => {
                 handle_connection_removed(
-                    connection_string, topic_gdp, &connections_topic, &mut connections,
+                    connection_string, topic_gdp, &connections_key, &mut connections,
                 );
             }
         }
     }
 }
 
-/// Register this node as a publisher in Redis.
-fn register_as_publisher(
-    redis_url: &str,
-    topic_gdp: GDPName,
-    my_gdp_name: GDPName,
-    topic_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let publishers_topic = format!("{}-publishers", topic_gdp);
-    add_entity_to_database_as_transaction(redis_url, &publishers_topic, &my_gdp_name.to_string())
-        .map_err(|e| format!("Failed to register as publisher: {}", e))?;
-    info!("Registered as publisher for topic: {} (GDP: {})", topic_name, topic_gdp);
-    Ok(())
-}
-
-/// Register this node as a proxy in Redis.
-fn register_as_proxy(
-    redis_url: &str,
-    topic_gdp: GDPName,
-    my_gdp_name: GDPName,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy_topic = format!("{}-proxies", topic_gdp);
-    add_entity_to_database_as_transaction(redis_url, &proxy_topic, &my_gdp_name.to_string())
-        .map_err(|e| format!("Failed to register as proxy: {}", e))?;
-    info!("Registered as proxy (GDP: {})", my_gdp_name);
-    Ok(())
-}
 
 /// Attach this node as a subscriber with a random delay to avoid thundering herd.
 async fn attach_as_subscriber(
     redis_url: &str,
-    connections_topic: &str,
-    publishers_topic: &str,
-    proxy_topic: &str,
+    topic_gdp: GDPName,
     topic_name: &str,
     my_gdp_name: GDPName,
 ) {
@@ -231,11 +194,12 @@ async fn attach_as_subscriber(
         + (rand::thread_rng().gen::<u64>() % SUBSCRIBER_ATTACH_RANDOM_DELAY_MS);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     
+    let (publishers_key, connections_key, proxy_key) = topic_redis_keys(topic_gdp);
     if let Err(e) = attach_subscriber(
         redis_url,
-        connections_topic,
-        publishers_topic,
-        proxy_topic,
+        &connections_key,
+        &publishers_key,
+        &proxy_key,
         topic_name,
         my_gdp_name,
     ) {
@@ -254,29 +218,25 @@ fn setup_topic(
 ) {
     let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
     
-    // Always spawn connection watcher to react to connection changes
-    tokio::spawn(watch_topic_connections(
+    // Always spawn connection manager to react to connection changes
+    tokio::spawn(manage_topic_connections(
         topic_name.clone(), topic_type.clone(), certificate.clone(), my_gdp_name,
     ));
 
     // Register role based on action
     match topic_action.as_str() {
         "pub" => {
-            if let Err(e) = register_as_publisher(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
+            if let Err(e) = register_publisher(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as publisher: {}", e);
             }
         }
         "sub" => {
-            let connections_topic = format!("{}-connections", topic_gdp);
-            let publishers_topic = format!("{}-publishers", topic_gdp);
-            let proxy_topic = format!("{}-proxies", topic_gdp);
             tokio::spawn(attach_as_subscriber(
-                &redis_url, &connections_topic, &publishers_topic, &proxy_topic,
-                &topic_name, my_gdp_name,
+                &redis_url, topic_gdp, &topic_name, my_gdp_name,
             ));
         }
         "proxy" => {
-            if let Err(e) = register_as_proxy(&redis_url, topic_gdp, my_gdp_name) {
+            if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name) {
                 error!("Error registering as proxy: {}", e);
             }
         }

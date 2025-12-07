@@ -66,8 +66,12 @@ async fn establish_connection(
     // Spawn connection setup in background
     tokio::spawn(async move {
         info!("[Connection] Starting WebRTC setup for signal_id: {}", my_signal_id);
-        let (webrtc_stream, webrtc_shutdown) = register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
-        info!("[Connection] WebRTC stream established successfully for signal_id: {}", my_signal_id);
+        let (webrtc_stream, webrtc_shutdown) = match register_webrtc_stream(&my_signal_id, signal_id_to_dial).await {
+            (stream, shutdown) => {
+                info!("[Connection] WebRTC stream established successfully for signal_id: {}", my_signal_id);
+                (stream, shutdown)
+            }
+        };
 
         let (ros_tx, ros_rx) = unbounded_channel();
         let (rtc_tx, rtc_rx) = unbounded_channel();

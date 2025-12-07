@@ -57,7 +57,7 @@ async fn handle_new_connection(
         let (webrtc_stream, webrtc_shutdown) =
             register_webrtc_stream(&my_signal_id_owned, signal_id_to_dial).await;
 
-        println!("WebRTC connected!");
+        info!("WebRTC stream established for signal_id: {}", my_signal_id_owned);
 
         let (ros_tx, ros_rx) = unbounded_channel();
         let (rtc_tx, rtc_rx) = unbounded_channel();
@@ -158,11 +158,11 @@ async fn create_topic_network_bridge(
                 .await
                 {
                     Some(shutdown_sender) => {
-                        connections.insert(connection_identifier, shutdown_sender);
-                        println!("WE THE BEST MUSIC");
+                        connections.insert(connection_identifier.clone(), shutdown_sender);
+                        info!("Successfully established connection: {}", connection_identifier);
                     }
                     None => {
-                        println!("We the worst music!");
+                        error!("Failed to establish connection: {}", connection_identifier);
                     }
                 }
             }
@@ -222,7 +222,7 @@ pub async fn ros_topic_discovery() {
                     &my_gdp_name.to_string(),
                 )
                 .unwrap();
-                info!("ADDING MYSELF TO PUBLISHERS!");
+                info!("Registered as publisher for topic: {} (GDP: {})", topic.topic_name, topic_gdp);
             }
             "sub" => {
                 tokio::time::sleep(Duration::from_millis(2000 + (rand::thread_rng().gen::<u64>() % 1000))).await;

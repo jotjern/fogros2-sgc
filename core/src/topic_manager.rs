@@ -17,98 +17,27 @@ const SUBSCRIBER_ATTACH_BASE_DELAY_MS: u64 = 2000;
 const SUBSCRIBER_ATTACH_RANDOM_DELAY_MS: u64 = 1000;
 const MAIN_LOOP_SLEEP_MS: u64 = 1000;
 
-/// Signal IDs for WebRTC signaling between publisher and subscriber.
-struct SignalIds {
-    my_signal_id: String,
-    signal_id_to_dial: Option<String>,
-}
-
-/// Generate signal IDs for WebRTC signaling based on connection and topic GDP name.
+/// Generate signal ID for this node and optionally the ID to dial (if subscriber).
 fn generate_signal_ids(
     topic_gdp: GDPName,
     connection: &Connection,
     my_gdp_name: GDPName,
-) -> SignalIds {
-    let publisher_signal_id = format!(
-        "{}-{}-{}",
-        topic_gdp, connection.publisher, connection.subscriber
-    );
-    let subscriber_signal_id = format!(
-        "{}-{}-{}",
-        topic_gdp, connection.subscriber, connection.publisher
-    );
-    
+) -> (String, Option<String>) {
     let is_publisher = connection.publisher == my_gdp_name;
     let my_signal_id = if is_publisher {
-        publisher_signal_id.clone()
+        format!("{}-{}-{}", topic_gdp, connection.publisher, connection.subscriber)
     } else {
-        subscriber_signal_id.clone()
+        format!("{}-{}-{}", topic_gdp, connection.subscriber, connection.publisher)
     };
     let signal_id_to_dial = if is_publisher {
         None
     } else {
-        Some(publisher_signal_id)
+        Some(format!("{}-{}-{}", topic_gdp, connection.publisher, connection.subscriber))
     };
-    
-    SignalIds {
-        my_signal_id,
-        signal_id_to_dial,
-    }
+    (my_signal_id, signal_id_to_dial)
 }
 
-/// Create WebRTC stream and ROS forwarding tasks for a connection.
-async fn create_connection_bridge(
-    my_signal_id: String,
-    signal_id_to_dial: Option<String>,
-    topic_name: String,
-    topic_type: String,
-    certificate: Vec<u8>,
-    my_gdp_name: GDPName,
-    is_publisher: bool,
-    shutdown_tx: broadcast::Sender<()>,
-) {
-    let (webrtc_stream, webrtc_shutdown) =
-        register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
-
-    info!("WebRTC stream established for signal_id: {}", my_signal_id);
-
-    let (ros_tx, ros_rx) = unbounded_channel();
-    let (rtc_tx, rtc_rx) = unbounded_channel();
-
-    let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
-
-    // Forward external shutdown to internal signaling tasks.
-    let mut external_shutdown = shutdown_tx.subscribe();
-    let webrtc_shutdown_clone = webrtc_shutdown.clone();
-    tokio::spawn(async move {
-        let _ = external_shutdown.recv().await;
-        let _ = webrtc_shutdown_clone.send(());
-    });
-
-    tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
-    if is_publisher {
-        info!("Spawning ros to network forwarder");
-        tokio::spawn(ros_to_network_forwarder(
-            node_name,
-            topic_name,
-            topic_type,
-            certificate,
-            rtc_tx,
-        ));
-    } else {
-        info!("Spawning network to ros forwarder");
-        tokio::spawn(network_to_ros_forwarder(
-            node_name,
-            topic_name,
-            topic_type,
-            certificate,
-            my_gdp_name,
-            ros_rx,
-        ));
-    }
-}
-
-/// Establish a new connection by creating WebRTC bridge and ROS forwarding.
+/// Establish a WebRTC connection and set up ROS forwarding.
 /// Returns a shutdown channel to control the connection lifecycle.
 async fn establish_connection(
     connection: Connection,
@@ -117,47 +46,64 @@ async fn establish_connection(
     certificate: &[u8],
     my_gdp_name: GDPName,
     topic_gdp: GDPName,
-) -> Option<broadcast::Sender<()>> {
+) -> broadcast::Sender<()> {
     info!(
         "Establishing connection in {} (gdp {}): {}",
-        topic_name,
-        topic_gdp,
-        connection.to_string()
+        topic_name, topic_gdp, connection.to_string()
     );
 
-    let signal_ids = generate_signal_ids(topic_gdp, &connection, my_gdp_name);
+    let (my_signal_id, signal_id_to_dial) = generate_signal_ids(topic_gdp, &connection, my_gdp_name);
     let is_publisher = connection.publisher == my_gdp_name;
 
-    // Create shutdown channel immediately so caller can control lifecycle
+    // Create shutdown channel for lifecycle control
     let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
-    let shutdown_tx_for_task = shutdown_tx.clone();
+    let shutdown_tx_for_webrtc = shutdown_tx.clone();
 
-    // Spawn bridge setup in background
+    // Spawn connection setup in background
     tokio::spawn(async move {
-        create_connection_bridge(
-            signal_ids.my_signal_id,
-            signal_ids.signal_id_to_dial,
-            topic_name.to_owned(),
-            topic_type.to_owned(),
-            certificate.to_vec(),
-            my_gdp_name,
-            is_publisher,
-            shutdown_tx_for_task,
-        )
-        .await;
+        let (webrtc_stream, webrtc_shutdown) =
+            register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
+
+        info!("WebRTC stream established for signal_id: {}", my_signal_id);
+
+        let (ros_tx, ros_rx) = unbounded_channel();
+        let (rtc_tx, rtc_rx) = unbounded_channel();
+        let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
+
+        // Forward shutdown signal to WebRTC
+        let mut shutdown_rx = shutdown_tx_for_webrtc.subscribe();
+        let webrtc_shutdown_clone = webrtc_shutdown.clone();
+        tokio::spawn(async move {
+            let _ = shutdown_rx.recv().await;
+            let _ = webrtc_shutdown_clone.send(());
+        });
+
+        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
+        
+        if is_publisher {
+            info!("Spawning ros to network forwarder");
+            tokio::spawn(ros_to_network_forwarder(
+                node_name, topic_name.to_owned(), topic_type.to_owned(),
+                certificate.to_vec(), rtc_tx,
+            ));
+        } else {
+            info!("Spawning network to ros forwarder");
+            tokio::spawn(network_to_ros_forwarder(
+                node_name, topic_name.to_owned(), topic_type.to_owned(),
+                certificate.to_vec(), my_gdp_name, ros_rx,
+            ));
+        }
     });
 
-    Some(shutdown_tx)
+    shutdown_tx
 }
 
-/// Check if this node is involved in the connection (either as publisher or subscriber).
-fn is_node_involved(connection: &Connection, my_gdp_name: GDPName) -> bool {
-    connection.publisher == my_gdp_name || connection.subscriber == my_gdp_name
-}
-
-/// Generate connection identifier for tracking connections.
-fn connection_identifier(topic_gdp: GDPName, connection: &Connection) -> String {
-    format!("{}-{}", topic_gdp, connection.to_string())
+/// Parse connection string, returning None on error.
+fn parse_connection(connection_string: &str) -> Option<Connection> {
+    Connection::from_str(connection_string).map_err(|e| {
+        error!("Failed to parse connection {}: {:?}", connection_string, e);
+        e
+    }).ok()
 }
 
 /// Handle a new connection being added to Redis.
@@ -170,17 +116,13 @@ async fn handle_connection_added(
     my_gdp_name: GDPName,
     connections: &mut HashMap<String, broadcast::Sender<()>>,
 ) {
-    let connection = match Connection::from_str(&connection_string) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to parse connection {}: {:?}", connection_string, e);
-            return;
-        }
+    let connection = match parse_connection(&connection_string) {
+        Some(c) => c,
+        None => return,
     };
 
-    let connection_id = connection_identifier(topic_gdp, &connection);
-
-    if !is_node_involved(&connection, my_gdp_name) {
+    // Skip if this node is not involved
+    if connection.publisher != my_gdp_name && connection.subscriber != my_gdp_name {
         info!(
             "Skipping connection not involving this node: publisher {}, subscriber {}, me {}",
             connection.publisher, connection.subscriber, my_gdp_name
@@ -188,24 +130,13 @@ async fn handle_connection_added(
         return;
     }
 
-    match establish_connection(
-        connection,
-        topic_name,
-        topic_type,
-        certificate,
-        my_gdp_name,
-        topic_gdp,
-    )
-    .await
-    {
-        Some(shutdown_sender) => {
-            connections.insert(connection_id.clone(), shutdown_sender);
-            info!("Successfully established connection: {}", connection_id);
-        }
-        None => {
-            error!("Failed to establish connection: {}", connection_id);
-        }
-    }
+    let connection_id = format!("{}-{}", topic_gdp, connection.to_string());
+    let shutdown_tx = establish_connection(
+        connection, topic_name, topic_type, certificate, my_gdp_name, topic_gdp,
+    ).await;
+    
+    connections.insert(connection_id.clone(), shutdown_tx);
+    info!("Successfully established connection: {}", connection_id);
 }
 
 /// Handle a connection being removed from Redis.
@@ -215,24 +146,17 @@ fn handle_connection_removed(
     connections_topic: &str,
     connections: &mut HashMap<String, broadcast::Sender<()>>,
 ) {
-    let connection = match Connection::from_str(&connection_string) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to parse removed connection {}: {:?}", connection_string, e);
-            return;
-        }
+    let connection = match parse_connection(&connection_string) {
+        Some(c) => c,
+        None => return,
     };
 
-    let connection_id = connection_identifier(topic_gdp, &connection);
-
+    let connection_id = format!("{}-{}", topic_gdp, connection.to_string());
     if let Some(shutdown) = connections.remove(&connection_id) {
         let _ = shutdown.send(());
         info!("Shutdown signal sent for connection: {}", connection_id);
     }
-    info!(
-        "Connection removed from {}: {}",
-        connections_topic, connection_string
-    );
+    info!("Connection removed from {}: {}", connections_topic, connection_string);
 }
 
 /// Watch Redis for connection changes and manage connections for a topic.
@@ -240,20 +164,12 @@ fn handle_connection_removed(
 async fn watch_topic_connections(
     topic_name: String, topic_type: String, certificate: Vec<u8>, my_gdp_name: GDPName,
 ) {
-    let topic_gdp = GDPName(get_gdp_name_from_topic(
-        &topic_name,
-        &topic_type,
-        &certificate,
-    ));
+    let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
     let connections_topic = format!("{}-connections", topic_gdp);
 
-    info!(
-        "Topic {} has connection topic: {}",
-        topic_name, connections_topic
-    );
+    info!("Watching connections for topic {} (GDP: {})", topic_name, topic_gdp);
 
     let mut connection_changes = watch_redis_list_items(connections_topic.clone()).await;
-    // Track both the bridge task and a shutdown signal for its WebRTC signaling tasks
     let mut connections: HashMap<String, broadcast::Sender<()>> = HashMap::new();
 
     while let Some(event) = connection_changes.recv().await {
@@ -261,56 +177,29 @@ async fn watch_topic_connections(
             RedisListChange::Added(connection_string) => {
                 info!("New connection detected: {}", connection_string);
                 handle_connection_added(
-                    connection_string,
-                    &topic_name,
-                    &topic_type,
-                    &certificate,
-                    topic_gdp,
-                    my_gdp_name,
-                    &mut connections,
-                )
-                .await;
+                    connection_string, &topic_name, &topic_type, &certificate,
+                    topic_gdp, my_gdp_name, &mut connections,
+                ).await;
             }
             RedisListChange::Removed(connection_string) => {
                 handle_connection_removed(
-                    connection_string,
-                    topic_gdp,
-                    &connections_topic,
-                    &mut connections,
+                    connection_string, topic_gdp, &connections_topic, &mut connections,
                 );
             }
         }
     }
 }
 
-/// Calculate topic GDP name from topic metadata.
-fn calculate_topic_gdp(topic_name: &str, topic_type: &str, certificate: &[u8]) -> GDPName {
-    GDPName(get_gdp_name_from_topic(topic_name, topic_type, certificate))
-}
-
-/// Generate Redis topic names for a given topic GDP.
-fn generate_redis_topic_names(topic_gdp: GDPName) -> (String, String, String) {
-    (
-        format!("{}-publishers", topic_gdp),
-        format!("{}-connections", topic_gdp),
-        format!("{}-proxies", topic_gdp),
-    )
-}
-
 /// Register this node as a publisher in Redis.
 fn register_as_publisher(
     redis_url: &str,
-    publishers_topic: &str,
+    topic_gdp: GDPName,
     my_gdp_name: GDPName,
     topic_name: &str,
-    topic_gdp: GDPName,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    add_entity_to_database_as_transaction(
-        redis_url,
-        publishers_topic,
-        &my_gdp_name.to_string(),
-    )
-    .map_err(|e| format!("Failed to register as publisher: {}", e))?;
+    let publishers_topic = format!("{}-publishers", topic_gdp);
+    add_entity_to_database_as_transaction(redis_url, &publishers_topic, &my_gdp_name.to_string())
+        .map_err(|e| format!("Failed to register as publisher: {}", e))?;
     info!("Registered as publisher for topic: {} (GDP: {})", topic_name, topic_gdp);
     Ok(())
 }
@@ -318,10 +207,11 @@ fn register_as_publisher(
 /// Register this node as a proxy in Redis.
 fn register_as_proxy(
     redis_url: &str,
-    proxy_topic: &str,
+    topic_gdp: GDPName,
     my_gdp_name: GDPName,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    add_entity_to_database_as_transaction(redis_url, proxy_topic, &my_gdp_name.to_string())
+    let proxy_topic = format!("{}-proxies", topic_gdp);
+    add_entity_to_database_as_transaction(redis_url, &proxy_topic, &my_gdp_name.to_string())
         .map_err(|e| format!("Failed to register as proxy: {}", e))?;
     info!("Registered as proxy (GDP: {})", my_gdp_name);
     Ok(())
@@ -362,51 +252,36 @@ fn setup_topic(
     my_gdp_name: GDPName,
     redis_url: String,
 ) {
-    let topic_gdp = calculate_topic_gdp(&topic_name, &topic_type, &certificate);
+    let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
     
     // Always spawn connection watcher to react to connection changes
     tokio::spawn(watch_topic_connections(
-        topic_name.clone(),
-        topic_type.clone(),
-        certificate.clone(),
-        my_gdp_name,
+        topic_name.clone(), topic_type.clone(), certificate.clone(), my_gdp_name,
     ));
-
-    let (publishers_topic, connections_topic, proxy_topic) =
-        generate_redis_topic_names(topic_gdp);
 
     // Register role based on action
     match topic_action.as_str() {
         "pub" => {
-            if let Err(e) = register_as_publisher(
-                &redis_url,
-                &publishers_topic,
-                my_gdp_name,
-                &topic_name,
-                topic_gdp,
-            ) {
+            if let Err(e) = register_as_publisher(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as publisher: {}", e);
             }
         }
         "sub" => {
+            let connections_topic = format!("{}-connections", topic_gdp);
+            let publishers_topic = format!("{}-publishers", topic_gdp);
+            let proxy_topic = format!("{}-proxies", topic_gdp);
             tokio::spawn(attach_as_subscriber(
-                &redis_url,
-                &connections_topic,
-                &publishers_topic,
-                &proxy_topic,
-                &topic_name,
-                my_gdp_name,
+                &redis_url, &connections_topic, &publishers_topic, &proxy_topic,
+                &topic_name, my_gdp_name,
             ));
         }
         "proxy" => {
-            if let Err(e) = register_as_proxy(&redis_url, &proxy_topic, my_gdp_name) {
+            if let Err(e) = register_as_proxy(&redis_url, topic_gdp, my_gdp_name) {
                 error!("Error registering as proxy: {}", e);
             }
         }
         "noop" => {}
-        action => {
-            error!("Unknown action '{}' for topic {}", action, topic_name);
-        }
+        action => error!("Unknown action '{}' for topic {}", action, topic_name),
     }
 }
 

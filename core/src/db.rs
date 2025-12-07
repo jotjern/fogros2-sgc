@@ -217,14 +217,26 @@ pub fn register_proxy(
     info!("Registered as proxy (GDP: {})", gdp_name);
     
     // Connect proxy to tree (publisher or upstream proxy)
-    crate::routing::connect_proxy_to_tree(
+    // This may fail if no upstream is available yet, but proxy is still registered
+    match crate::routing::connect_proxy_to_tree(
         redis_url,
         &connections_key,
         &publishers_key,
         &proxy_key,
         topic_name,
         gdp_name,
-    ).map_err(|e| format!("Failed to connect proxy to tree: {}", e))?;
+    ) {
+        Ok(connected) => {
+            if connected {
+                info!("Proxy {} connected to tree during registration", gdp_name);
+            } else {
+                info!("Proxy {} registered but no upstream available yet; will connect when available", gdp_name);
+            }
+        }
+        Err(e) => {
+            error!("Failed to connect proxy {} to tree: {} (proxy still registered)", gdp_name, e);
+        }
+    }
     
     Ok(())
 }

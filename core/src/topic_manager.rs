@@ -12,17 +12,12 @@ use utils::app_config::AppConfig;
 
 use crate::db::*;
 
-async fn handle_new_connection(
-    connection: Connection, topic_name: &str, topic_type: &str, certificate: &Vec<u8>,
-    my_gdp_name: GDPName, topic_gdp: GDPName,
-) -> Option<broadcast::Sender<()>> {
-    info!(
-        "New connection in {} (gdp {}): {}",
-        topic_name,
-        topic_gdp,
-        connection.to_string()
-    );
-
+/// Generate signal IDs for WebRTC signaling based on connection and topic GDP name.
+fn generate_signal_ids(
+    topic_gdp: GDPName,
+    connection: &Connection,
+    my_gdp_name: GDPName,
+) -> (String, String, String, Option<String>) {
     let publisher_signal_id = format!(
         "{}-{}-{}",
         topic_gdp, connection.publisher, connection.subscriber
@@ -36,63 +31,101 @@ async fn handle_new_connection(
     } else {
         subscriber_signal_id.clone()
     };
-
     let signal_id_to_dial = if connection.publisher == my_gdp_name {
         None
     } else {
-        Some(publisher_signal_id)
+        Some(publisher_signal_id.clone())
     };
+    (publisher_signal_id, subscriber_signal_id, my_signal_id, signal_id_to_dial)
+}
+
+/// Set up WebRTC stream and ROS forwarding tasks for a connection.
+async fn setup_webrtc_ros_bridge(
+    my_signal_id: String,
+    signal_id_to_dial: Option<String>,
+    topic_name: String,
+    topic_type: String,
+    certificate: Vec<u8>,
+    my_gdp_name: GDPName,
+    is_publisher: bool,
+    shutdown_tx: broadcast::Sender<()>,
+) {
+    let (webrtc_stream, webrtc_shutdown) =
+        register_webrtc_stream(&my_signal_id, signal_id_to_dial).await;
+
+    info!("WebRTC stream established for signal_id: {}", my_signal_id);
+
+    let (ros_tx, ros_rx) = unbounded_channel();
+    let (rtc_tx, rtc_rx) = unbounded_channel();
+
+    let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
+
+    // Forward external shutdown to internal signaling tasks.
+    let mut external_shutdown = shutdown_tx.subscribe();
+    let webrtc_shutdown_clone = webrtc_shutdown.clone();
+    tokio::spawn(async move {
+        let _ = external_shutdown.recv().await;
+        let _ = webrtc_shutdown_clone.send(());
+    });
+
+    tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
+    if is_publisher {
+        info!("Spawning ros to network forwarder");
+        tokio::spawn(ros_to_network_forwarder(
+            node_name,
+            topic_name,
+            topic_type,
+            certificate,
+            rtc_tx,
+        ));
+    } else {
+        info!("Spawning network to ros forwarder");
+        tokio::spawn(network_to_ros_forwarder(
+            node_name,
+            topic_name,
+            topic_type,
+            certificate,
+            my_gdp_name,
+            ros_rx,
+        ));
+    }
+}
+
+async fn handle_new_connection(
+    connection: Connection,
+    topic_name: &str,
+    topic_type: &str,
+    certificate: &[u8],
+    my_gdp_name: GDPName,
+    topic_gdp: GDPName,
+) -> Option<broadcast::Sender<()>> {
+    info!(
+        "New connection in {} (gdp {}): {}",
+        topic_name,
+        topic_gdp,
+        connection.to_string()
+    );
+
+    let (_publisher_signal_id, _subscriber_signal_id, my_signal_id, signal_id_to_dial) =
+        generate_signal_ids(topic_gdp, &connection, my_gdp_name);
 
     // Expose shutdown immediately; set up WebRTC and ROS bridging in the background.
     let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
     let shutdown_tx_for_task = shutdown_tx.clone();
-    let topic_name_owned = topic_name.to_owned();
-    let topic_type_owned = topic_type.to_owned();
-    let certificate_owned = certificate.clone();
-    let my_signal_id_owned = my_signal_id.clone();
     let is_publisher = connection.publisher == my_gdp_name;
-    let my_gdp_name_owned = my_gdp_name;
 
     tokio::spawn(async move {
-        let (webrtc_stream, webrtc_shutdown) =
-            register_webrtc_stream(&my_signal_id_owned, signal_id_to_dial).await;
-
-        info!("WebRTC stream established for signal_id: {}", my_signal_id_owned);
-
-        let (ros_tx, ros_rx) = unbounded_channel();
-        let (rtc_tx, rtc_rx) = unbounded_channel();
-
-        let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
-
-        // Forward external shutdown to internal signaling tasks.
-        let mut external_shutdown = shutdown_tx_for_task.subscribe();
-        let webrtc_shutdown_clone = webrtc_shutdown.clone();
-        tokio::spawn(async move {
-            let _ = external_shutdown.recv().await;
-            let _ = webrtc_shutdown_clone.send(());
-        });
-
-        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
-        if is_publisher {
-            info!("Spawning ros to network forwarder");
-            tokio::spawn(ros_to_network_forwarder(
-                node_name,
-                topic_name_owned,
-                topic_type_owned,
-                certificate_owned,
-                rtc_tx,
-            ));
-        } else {
-            info!("Spawning network to ros forwarder");
-            tokio::spawn(network_to_ros_forwarder(
-                node_name,
-                topic_name_owned,
-                topic_type_owned,
-                certificate_owned,
-                my_gdp_name_owned,
-                ros_rx,
-            ));
-        }
+        setup_webrtc_ros_bridge(
+            my_signal_id,
+            signal_id_to_dial,
+            topic_name.to_owned(),
+            topic_type.to_owned(),
+            certificate.to_vec(),
+            my_gdp_name,
+            is_publisher,
+            shutdown_tx_for_task,
+        )
+        .await;
     });
 
     Some(shutdown_tx)

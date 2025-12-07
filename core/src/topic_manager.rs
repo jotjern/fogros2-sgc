@@ -12,6 +12,11 @@ use utils::app_config::AppConfig;
 
 use crate::db::*;
 
+// Constants for timing and delays
+const SUBSCRIBER_ATTACH_BASE_DELAY_MS: u64 = 2000;
+const SUBSCRIBER_ATTACH_RANDOM_DELAY_MS: u64 = 1000;
+const MAIN_LOOP_SLEEP_MS: u64 = 1000;
+
 /// Generate signal IDs for WebRTC signaling based on connection and topic GDP name.
 /// Returns: (publisher_signal_id, subscriber_signal_id, my_signal_id, signal_id_to_dial)
 fn generate_signal_ids(
@@ -322,8 +327,9 @@ async fn attach_as_subscriber(
     topic_name: &str,
     my_gdp_name: GDPName,
 ) {
-    // Random delay between 2-3 seconds to avoid thundering herd problem
-    let delay_ms = 2000 + (rand::thread_rng().gen::<u64>() % 1000);
+    // Random delay to avoid thundering herd problem
+    let delay_ms = SUBSCRIBER_ATTACH_BASE_DELAY_MS 
+        + (rand::thread_rng().gen::<u64>() % SUBSCRIBER_ATTACH_RANDOM_DELAY_MS);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     
     if let Err(e) = attach_subscriber(
@@ -419,6 +425,6 @@ pub async fn ros_topic_discovery() {
     }
 
     loop {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        tokio::time::sleep(Duration::from_millis(MAIN_LOOP_SLEEP_MS)).await;
     }
 }

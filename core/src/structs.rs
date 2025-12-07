@@ -275,8 +275,18 @@ impl FromStr for Connection {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
       let mut parts = s.split("-");
 
-      let publisher = GDPName::from_str(parts.next().unwrap())?;
-      let subscriber = GDPName::from_str(parts.next().unwrap())?;
+      let publisher_str = parts.next()
+          .ok_or_else(|| "invalid".parse::<i32>().unwrap_err())?;
+      let subscriber_str = parts.next()
+          .ok_or_else(|| "invalid".parse::<i32>().unwrap_err())?;
+
+      // Check for extra parts
+      if parts.next().is_some() {
+          return Err("invalid".parse::<i32>().unwrap_err());
+      }
+
+      let publisher = GDPName::from_str(publisher_str)?;
+      let subscriber = GDPName::from_str(subscriber_str)?;
 
       Ok(Connection {
         publisher,

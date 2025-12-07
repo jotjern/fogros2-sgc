@@ -61,19 +61,26 @@ pub fn parse_header_payload_pairs(
         // Split buffer at first null byte: [header]\0[payload + rest]
         let header_and_remaining = buffer.splitn(2, |c| c == &0).collect::<Vec<_>>();
         let header_buf = header_and_remaining[0];
-        let header: &str = std::str::from_utf8(header_buf).unwrap();
+        let header: &str = match std::str::from_utf8(header_buf) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to parse header as UTF-8: {}", e);
+                continue;
+            }
+        };
         info!("received header json string: {:?}", header);
         
         // Try parsing JSON header
-        let gdp_header_parsed = serde_json::from_str::<GDPHeaderInTransit>(header);
-        if gdp_header_parsed.is_err() {
-            warn!("header is not complete, return the remaining");
-            return (
-                header_payload_pairs,
-                Some((default_gdp_header, header_buf.to_vec())),
-            );
-        }
-        let gdp_header = gdp_header_parsed.unwrap();
+        let gdp_header = match serde_json::from_str::<GDPHeaderInTransit>(header) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Header parsing failed (may be incomplete): {}, returning remaining buffer", e);
+                return (
+                    header_payload_pairs,
+                    Some((default_gdp_header, header_buf.to_vec())),
+                );
+            }
+        };
         let remaining = header_and_remaining[1];
 
         // Check if we have enough data for the payload

@@ -54,6 +54,11 @@ async fn establish_connection(
     let (my_signal_id, signal_id_to_dial) = generate_signal_ids(topic_gdp, &connection, my_gdp_name);
     let is_publisher = connection.publisher == my_gdp_name;
 
+    // Clone data needed in spawned task
+    let topic_name_owned = topic_name.to_owned();
+    let topic_type_owned = topic_type.to_owned();
+    let certificate_owned = certificate.to_vec();
+
     // Create shutdown channel for lifecycle control
     let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
     let shutdown_tx_for_webrtc = shutdown_tx.clone();
@@ -82,14 +87,14 @@ async fn establish_connection(
         if is_publisher {
             info!("Spawning ros to network forwarder");
             tokio::spawn(ros_to_network_forwarder(
-                node_name, topic_name.to_owned(), topic_type.to_owned(),
-                certificate.to_vec(), rtc_tx,
+                node_name, topic_name_owned, topic_type_owned,
+                certificate_owned, rtc_tx,
             ));
         } else {
             info!("Spawning network to ros forwarder");
             tokio::spawn(network_to_ros_forwarder(
-                node_name, topic_name.to_owned(), topic_type.to_owned(),
-                certificate.to_vec(), my_gdp_name, ros_rx,
+                node_name, topic_name_owned, topic_type_owned,
+                certificate_owned, my_gdp_name, ros_rx,
             ));
         }
     });
@@ -195,7 +200,7 @@ async fn attach_as_subscriber(
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     
     let (publishers_key, connections_key, proxy_key) = topic_redis_keys(topic_gdp);
-    if let Err(e) = attach_subscriber(
+    if !attach_subscriber(
         redis_url,
         &connections_key,
         &publishers_key,
@@ -203,7 +208,7 @@ async fn attach_as_subscriber(
         topic_name,
         my_gdp_name,
     ) {
-        error!("Failed to attach as subscriber for topic {}: {:?}", topic_name, e);
+        error!("Failed to attach as subscriber for topic {}", topic_name);
     }
 }
 

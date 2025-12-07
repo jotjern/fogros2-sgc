@@ -1,3 +1,9 @@
+x-app-build: &app-build
+  context: ./
+  dockerfile: ./Dockerfile
+
+x-app-image: &app-image fogros2-sgc-app
+
 version: "3"
 name: fogros2-sgc-lite
 
@@ -9,9 +15,8 @@ services:
 
     signal:
       restart: always
-      build: 
-        context: ./
-        dockerfile: ./Dockerfile
+      image: *app-image
+      build: *app-build
       init: true
       ports:
         - '8000:8000'  # use 8000 for public interface of signaling server
@@ -27,9 +32,8 @@ services:
 
     talker:
         restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
+        image: *app-image
+        build: *app-build
         volumes:
           - "./src:/src" 
           - "./scripts:/scripts" 
@@ -47,9 +51,8 @@ services:
           /gdp-router router"
     listener:
         restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
+        image: *app-image
+        build: *app-build
         volumes:
           - "./src:/src" 
           - "./scripts:/scripts" 
@@ -70,9 +73,8 @@ services:
           /gdp-router router"
     proxy:
         restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
+        image: *app-image
+        build: *app-build
         volumes:
           - "./src:/src" 
           - "./scripts:/scripts" 

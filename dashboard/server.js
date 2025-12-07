@@ -69,7 +69,7 @@ io.on('connection', (socket) => {
       debugSub = new Redis(redisConfig);
       debugSub.on('message', (channel, msg) => {
         if (channel !== 'debug-messages') return;
-        console.log('debug-messages ->', msg);
+        // console.log('debug-messages ->', msg);
         try {
           const parsed = JSON.parse(msg);
           socket.emit('debug-event', parsed);

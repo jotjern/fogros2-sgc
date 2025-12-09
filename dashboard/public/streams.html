@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Streams</title>
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
+    header { padding: 20px; background: #111827; border-bottom: 1px solid #1f2937; display:flex; align-items:center; justify-content:space-between; }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0.5px; }
+    :root { --grid-scale: 1; }
+    .grid { display: grid; gap: 24px; padding: 0 clamp(60px, 12vw, 240px); grid-template-columns: repeat(3, 1fr); max-width: 2400px; margin: 0 auto; transform: scale(var(--grid-scale)); transform-origin: top center; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.3); display: flex; flex-direction: column; }
+    .card header { padding: 12px 14px; background: linear-gradient(135deg,#1e293b,#0f172a); border-bottom: 1px solid #1f2937; }
+    .card h2 { margin: 0; font-size: 14px; color: #7dd3fc; }
+    .card p { margin: 6px 0 0; font-size: 12px; color: #cbd5e1; }
+    .card canvas { width: calc(100% - 40px); margin: 0 auto; aspect-ratio: 16 / 9; display: block; background: #0b1220; opacity: 1; }
+    #status { font-size: 12px; color: #f8fafc; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>/streams</h1>
+      <div id="status">Loading listener list...</div>
+    </div>
+    <button onclick="refresh()" style="background:#22c55e;border:none;color:#0f172a;font-weight:700;padding:10px 14px;border-radius:10px;cursor:pointer;">Refresh</button>
+  </header>
+  <main>
+    <div class="grid" id="grid"></div>
+  </main>
+
+  <script>
+    function updateScale() {
+      const scale = (window.visualViewport && window.visualViewport.scale) ? window.visualViewport.scale : 1;
+      document.documentElement.style.setProperty('--grid-scale', scale);
+    }
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', updateScale);
+      window.visualViewport.addEventListener('scroll', updateScale);
+    }
+    updateScale();
+
+    async function fetchStreams() {
+      const res = await fetch('/streams-data');
+      if (!res.ok) throw new Error('Failed to load stream data');
+      return res.json();
+    }
+
+    function render(data) {
+      const grid = document.getElementById('grid');
+      const listeners = data.listeners;
+      const seen = new Set();
+      document.getElementById('status').textContent = listeners.length ? `${listeners.length} listener(s) online` : 'No listeners found';
+
+      listeners.forEach(listener => {
+        seen.add(listener.gdp);
+        let card = grid.querySelector(`[data-gdp=\"${listener.gdp}\"]`);
+        if (!card) {
+          card = document.createElement('div');
+          card.className = 'card';
+          card.dataset.gdp = listener.gdp;
+          const header = document.createElement('header');
+          header.innerHTML = `<h2>${listener.container}</h2><p>GDP: ${listener.gdp}</p>`;
+          const canvas = document.createElement('canvas');
+          canvas.width = 1080;
+          canvas.height = 720;
+          canvas.dataset.container = listener.container;
+          card.appendChild(header);
+          card.appendChild(canvas);
+          grid.appendChild(card);
+        } else {
+          const header = card.querySelector('header');
+          header.innerHTML = `<h2>${listener.container}</h2><p>GDP: ${listener.gdp}</p>`;
+        }
+
+        const canvas = card.querySelector('canvas');
+        const ctx = canvas.getContext('2d');
+        const nextSrc = `${listener.proxyUrl}?t=${Date.now()}`;
+        if (canvas.dataset.target === nextSrc) return;
+        canvas.dataset.target = nextSrc;
+
+        fetch(nextSrc)
+          .then(resp => {
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            return resp.blob();
+          })
+          .then(blob => createImageBitmap(blob))
+          .then(bitmap => {
+            if (canvas.dataset.target !== nextSrc) return; // superseded
+            // Clear and draw fitted inside 16:9 canvas
+            ctx.fillStyle = '#0b1220';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            const scale = Math.min(canvas.width / bitmap.width, canvas.height / bitmap.height);
+            const drawW = bitmap.width * scale;
+            const drawH = bitmap.height * scale;
+            const dx = (canvas.width - drawW) / 2;
+            const dy = (canvas.height - drawH) / 2;
+            ctx.drawImage(bitmap, dx, dy, drawW, drawH);
+          })
+          .catch(() => {
+            if (canvas.dataset.target === nextSrc) {
+              ctx.fillStyle = '#111827';
+              ctx.fillRect(0, 0, canvas.width, canvas.height);
+              ctx.fillStyle = '#e11d48';
+              ctx.fillText('Load failed', 10, 20);
+            }
+          });
+      });
+
+      // Remove cards for listeners no longer present
+      Array.from(grid.querySelectorAll('[data-gdp]')).forEach(card => {
+        if (!seen.has(card.dataset.gdp)) {
+          grid.removeChild(card);
+        }
+      });
+    }
+
+    async function refresh() {
+      try {
+        const data = await fetchStreams();
+        render(data);
+      } catch (e) {
+        document.getElementById('status').textContent = e.message;
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

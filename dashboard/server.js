@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -10,6 +11,85 @@ const io = new Server(server, {
 });
 
 app.use(express.static('public'));
+
+app.get('/streams', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'streams.html'));
+});
+
+// Provide listener metadata for the streams page.
+app.get('/streams-data', async (_req, res) => {
+  const host = process.env.REDIS_HOST || 'localhost';
+  const port = parseInt(process.env.REDIS_PORT || '6379', 10);
+  const redis = new Redis({ host, port, lazyConnect: true });
+  try {
+    await redis.connect();
+    const connectionKeys = await redis.keys('*-connections');
+    const mappingKeys = await redis.keys('gdp-name-mapping:*');
+    const publisherKeys = await redis.keys('*-publishers');
+
+    const gdpMappings = {};
+    for (const key of mappingKeys) {
+      const gdp = key.replace('gdp-name-mapping:', '');
+      const names = await redis.lrange(key, 0, -1);
+      if (names.length > 0) gdpMappings[gdp] = names[0];
+    }
+
+    const publisherSet = new Set();
+    for (const key of publisherKeys) {
+      const pubs = await redis.lrange(key, 0, -1);
+      pubs.forEach((p) => publisherSet.add(p));
+    }
+
+    const listeners = [];
+    const seen = new Set();
+    for (const key of connectionKeys) {
+      const topicId = key.replace(/-connections$/, '');
+      const connections = await redis.lrange(key, 0, -1);
+      connections.forEach((conn) => {
+        const parts = conn.split('-');
+        if (parts.length !== 2) return;
+        const subscriber = parts[1];
+        if (publisherSet.has(subscriber)) return; // skip publishers
+        const containerName = gdpMappings[subscriber] || subscriber;
+        if (containerName.includes('proxy')) return; // skip proxies
+        if (seen.has(subscriber)) return; // de-dup per listener
+        seen.add(subscriber);
+        const container = gdpMappings[subscriber] || subscriber;
+        listeners.push({
+          gdp: subscriber,
+          container,
+          topic: topicId,
+          proxyUrl: `/stream/${container}/latest.jpg`,
+        });
+      });
+    }
+
+    res.json({ listeners });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { await redis.disconnect(); } catch (_) {}
+  }
+});
+
+// Proxy latest frame from a listener container so the browser doesn't need Docker DNS access.
+app.get('/stream/:container/latest.jpg', async (req, res) => {
+  const container = req.params.container;
+  const target = `http://${container}:8081/latest.jpg`;
+  try {
+    const response = await fetch(target);
+    if (!response.ok) {
+      res.status(502).send(`Upstream error: ${response.status}`);
+      return;
+    }
+    const buf = Buffer.from(await response.arrayBuffer());
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buf);
+  } catch (e) {
+    res.status(502).send(`Failed to reach ${target}: ${e.message}`);
+  }
+});
 
 io.on('connection', (socket) => {
   console.log('Client connected');

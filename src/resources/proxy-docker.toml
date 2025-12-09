@@ -46,4 +46,4 @@ action = "proxy"
 # topic_name of fogros2-sgc node that will publish/subscribe to
 topic_name = "/chatter"
 # topic type of fogros2-sgc node that will publish/subscribe to
-topic_type = "std_msgs/msg/String"
+topic_type = "sensor_msgs/msg/CompressedImage"

@@ -24,6 +24,6 @@ automatic_topic_discovery = false
 # noop = do nothing, used to exclude certain topics in auto mode
 action = "sub"
 # topic_name of fogros2-sgc node that will publish/subscribe to
-topic_name = "/chatter"
+topic_name = "/benchmark"
 # topic type of fogros2-sgc node that will publish/subscribe to
 topic_type = "std_msgs/msg/String"

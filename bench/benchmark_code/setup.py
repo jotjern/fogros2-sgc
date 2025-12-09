@@ -36,7 +36,7 @@ setup(
         (os.path.join("share", package_name), ["package.xml"]),
         (os.path.join("share", package_name), glob("launch/*.launch.py")),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "Pillow"],
     zip_safe=True,
     author="Kaiyuan (Eric) Chen",
     author_email="kych@berkeley.edu",

@@ -16,7 +16,7 @@ class MinimalPublisher(Node):
 
     def __init__(self):
         super().__init__('minimal_publisher')
-        self.publisher_ = self.create_publisher(CompressedImage, 'benchmark', 10)
+        self.publisher_ = self.create_publisher(String, 'chatter', 10)
         self.timer = self.create_timer(0.001, self.timer_callback)
         self.i = 0
 

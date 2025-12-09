@@ -12,7 +12,7 @@ class MinimalSubscriber(Node):
         self.received_msgs = 0
         self.subscription = self.create_subscription(
             CompressedImage,
-            '/benchmark',
+            '/chatter',
             self.callback,
             10)
         self.subscription  # prevent unused variable warning

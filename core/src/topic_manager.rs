@@ -13,7 +13,7 @@ use utils::app_config::AppConfig;
 
 // Constants for timing and delays
 const SUBSCRIBER_ATTACH_BASE_DELAY_MS: u64 = 2000;
-const SUBSCRIBER_ATTACH_RANDOM_DELAY_MS: u64 = 1000;
+const SUBSCRIBER_ATTACH_RANDOM_DELAY_MS: u64 = 5000;
 const MAIN_LOOP_SLEEP_MS: u64 = 1000;
 
 /// Generate signal ID for this node and optionally the ID to dial (if subscriber).

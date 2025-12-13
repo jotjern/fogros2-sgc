@@ -1,43 +1,41 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
-from sensor_msgs.msg import CompressedImage
-from time import time 
-from time import sleep
+import time
 
-def payload_generator(id, size = 1000):
-    return b"1" * size
+# Benchmark parameters
+MESSAGE_SIZE_BYTES = 10000    # Payload size per message
+MESSAGE_RATE_HZ = 10         # Messages per second
+# Expected bandwidth: MESSAGE_SIZE_BYTES * MESSAGE_RATE_HZ
 
-def payload_to_latency(payload):
-    ts = float(payload.split(",")[1])
-    return time() - ts
-
-class MinimalPublisher(Node):
-
+class ThroughputPublisher(Node):
     def __init__(self):
-        super().__init__('minimal_publisher')
-        self.publisher_ = self.create_publisher(CompressedImage, 'benchmark', 10)
-        self.timer = self.create_timer(0.001, self.timer_callback)
-        self.i = 0
+        super().__init__('throughput_publisher')
+        self.publisher_ = self.create_publisher(String, 'chatter', 10)
+        self.payload = "1" * MESSAGE_SIZE_BYTES
+        self.interval = 1.0 / MESSAGE_RATE_HZ
+        self.get_logger().info(
+            f'Publishing {MESSAGE_SIZE_BYTES} bytes at {MESSAGE_RATE_HZ} Hz '
+            f'(~{MESSAGE_SIZE_BYTES * MESSAGE_RATE_HZ / 1_000_000:.1f} MB/s)'
+        )
 
-    def timer_callback(self):
-        msg = CompressedImage()
-        msg.data = payload_generator(self.i)
+    def publish_message(self):
+        msg = String()
+        msg.data = self.payload
         self.publisher_.publish(msg)
-        self.i += 1
-
-    def listener_callback(self, msg):
-        print(payload_to_latency(msg.data))
 
 
 def main(args=None):
     rclpy.init(args=args)
-
-    minimal_publisher = MinimalPublisher()
-
-    rclpy.spin(minimal_publisher)
-
-    minimal_publisher.destroy_node()
+    node = ThroughputPublisher()
+    next_time = time.time()
+    while rclpy.ok():
+        node.publish_message()
+        next_time += node.interval
+        sleep_duration = next_time - time.time()
+        if sleep_duration > 0:
+            time.sleep(sleep_duration)
+    node.destroy_node()
     rclpy.shutdown()
 
 

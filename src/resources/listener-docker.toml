@@ -38,12 +38,8 @@ action = "noop"
 topic_name = "/parameter_events"
 # topic type of fogros2-sgc node that will publish/subscribe to
 topic_type = "rcl_interfaces/msg/ParameterEvent"
+
 [[ros]]
 action = "sub"
-# pub = subscribe to local topic and publish to remote topic
-# sub = publish to local topic and subscribe to remote topic
-# noop = do nothing, used to exclude certain topics in auto mode
-# topic_name of fogros2-sgc node that will publish/subscribe to
 topic_name = "/chatter"
-# topic type of fogros2-sgc node that will publish/subscribe to
 topic_type = "std_msgs/msg/String"

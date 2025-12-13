@@ -24,3 +24,12 @@ redis://rib:6379
 4. Subscriber watches {topic}-pub for URLs ending with its GUID
 5. When match found, both establish WebRTC connection using signaling server
 6. Redis keyspace notifications enable dynamic discovery of new publishers/subscribers
+
+
+# Without routers, distress 100
+For 1..9 listeners, 1 publisher:
+    ...
+
+# With routers, distress 3:
+for 1..9 listeners, 1 publisher:
+    ...

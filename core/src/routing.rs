@@ -33,8 +33,8 @@ struct LeafPublisherView {
 }
 
 // Distress thresholds
-const PUBLISHER_DISTRESS_THRESHOLD: usize = 3;
-const PROXY_DISTRESS_THRESHOLD: usize = 5;
+const PUBLISHER_DISTRESS_THRESHOLD: usize = 100;
+const PROXY_DISTRESS_THRESHOLD: usize = 100;
 
 /// Add a node to the distress list
 fn add_to_distress(

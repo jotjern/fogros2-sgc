@@ -27,126 +27,151 @@ use futures_util::{future, pin_mut, StreamExt};
 
 type Id = String;
 type Tx = mpsc::UnboundedSender<Message>;
-type ClientsMap = Arc<Mutex<HashMap<Id, Tx>>>;
+#[derive(Clone)]
+struct ClientEntry {
+    gen: u64,
+    tx: Tx,
+}
+type ClientsMap = Arc<Mutex<HashMap<Id, ClientEntry>>>;
 
-// WebRTC Signaling Server for FogROS2-SGC
+// WebRTC Signaling Server
 //
-// Acts as a message relay between WebRTC peers that need to establish direct connections.
-// Listens on port 8000 for WebSocket connections at ws://server:8000/{client_id}
-//
-// Message Flow:
-// - Client A connects → registered in HashMap with its client_id
-// - Client A sends JSON: {"id": "client_b_id", "payload": {...}}
-// - Server rewrites sender: {"id": "client_a_id", "payload": {...}}
-// - Server forwards to Client B if connected
-// - Payloads contain WebRTC signaling (SDP offers/answers, ICE candidates)
-//
-// Client ID Format: Each WebRTC connection establishes TWO WebSocket connections
-// Publisher-side: "topic,publisher_guid,subscriber_guid"
-// Subscriber-side: "topic,subscriber_guid,publisher_guid" (flipped middle/last)
-//
-// Example WebRTC session:
-//   Publisher connects:  167,229,32,134,143,191,106,193,89,194,153,70
-//   Subscriber connects: 167,229,32,134,89,194,153,70,143,191,106,193 (same bytes, flipped)
-//
-// Redis RIB structure:
-//   {topic}-pub: stores full publisher-side client_id (topic,publisher,subscriber)
-//   {topic}-sub: stores just subscriber_guid (bytes 5-8 from subscriber-side format)
-//
-// Redis Integration (RIB - Routing Information Base):
-// - On disconnect: tries to remove from both {topic}-pub and {topic}-sub
-// - Depending on which side disconnects, one removal succeeds and one warns (expected)
-// - Publisher-side: successfully removes from -pub, warns on -sub
-// - Subscriber-side: successfully removes from -sub, warns on -pub
+// On websocket disconnect, we trigger routing cleanup:
+// - Parse client_id as `{topic_gdp}-{self}-{peer}` (hex GDPName strings)
+// - Call `disconnect(self)` on `{topic_gdp}-routing` in Redis (WATCH/MULTI/EXEC CAS)
 
-/// Computes the paired client_id by swapping bytes 5-8 with bytes 9-12
-/// Example: "167,229,32,134,A,A,A,A,B,B,B,B" -> "167,229,32,134,B,B,B,B,A,A,A,A"
-fn get_paired_client_id(client_id: &str) -> String {
-    let parts: Vec<&str> = client_id.split(',').collect();
-    if parts.len() != 12 {
-        return String::new();
-    }
-    format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{}",
-        parts[0], parts[1], parts[2], parts[3],
-        parts[8], parts[9], parts[10], parts[11],
-        parts[4], parts[5], parts[6], parts[7]
-    )
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap as StdHashMap, HashSet, VecDeque};
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RoutingState {
+    publishers: Vec<String>,
+    proxies: Vec<String>,
+    edges: Vec<String>, // "parent-child"
 }
 
-/// Removes the client (identified by `client_id`) from publisher and subscriber lists in the RIB
-fn remove_client_from_rib(client_id: &str) {
-    // Connect to the Redis server
-    let client =
-        redis::Client::open("redis://fogros2-sgc-lite-rib-1").expect("redis client open failed");
-    let mut con = client.get_connection().unwrap();
-
-    // Build topic key using the first 4 comma-separated elements of client_id
-    let topic_key_name = client_id
-        .split('-')
-        .next()
-        .unwrap();
-    // Publisher and subscriber Redis list keys
-    let publisher_topic = format!("{}-pub", topic_key_name.clone());
-    let subscriber_topic = format!("{}-sub", topic_key_name.clone());
-
-    println!("Removing client {} from RIB", client_id);
-
-    // Remove client_id from the publisher list in Redis
-    // WARNING: weird behavior
-    // Due to an unknown reason, we need to flip the subscriber_id and
-    // publisher_id to remove the client from the RIB
-    let paired_client_id = get_paired_client_id(client_id);
-    let result: Result<isize, redis::RedisError> =
-        redis::cmd("LREM")
-            .arg(&publisher_topic)
-            .arg(0)
-            .arg(paired_client_id)
-            .query(&mut con);
-    match &result {
-        Ok(0) => println!(
-            "Warning: client '{}' was not found in publisher list '{}'",
-            client_id, publisher_topic
-        ),
-        Ok(count) => println!(
-            "Removed client '{}' from publisher list '{}', {} occurrence(s) removed.",
-            client_id, publisher_topic, count
-        ),
-        Err(e) => eprintln!(
-            "Error removing client '{}' from publisher list '{}': {}",
-            client_id, publisher_topic, e
-        ),
+impl RoutingState {
+    fn normalize(&mut self) {
+        self.publishers.sort();
+        self.publishers.dedup();
+        self.proxies.sort();
+        self.proxies.dedup();
+        self.edges.sort();
+        self.edges.dedup();
     }
+}
 
-    // Extract bytes 5-8 to remove from -sub list
-    // For publisher-side format (topic,pub,sub): extracts pub → removal fails (expected)
-    // For subscriber-side format (topic,sub,pub): extracts sub → removal succeeds
-    let subscriber_name = client_id
-        .split('-')
-        .nth(1)
-        .unwrap();
-
-    // Remove subscriber_name from the subscriber list in Redis
-    let result: Result<isize, redis::RedisError> =
-        redis::cmd("LREM")
-            .arg(&subscriber_topic)
-            .arg(0)
-            .arg(&subscriber_name)
-            .query(&mut con);
-    match &result {
-        Ok(0) => println!(
-            "Warning: subscriber '{}' was not found in subscriber list '{}'",
-            subscriber_name, subscriber_topic
-        ),
-        Ok(count) => println!(
-            "Removed subscriber '{}' from subscriber list '{}', {} occurrence(s) removed.",
-            subscriber_name, subscriber_topic, count
-        ),
-        Err(e) => eprintln!(
-            "Error removing subscriber '{}' from subscriber list '{}': {}",
-            subscriber_name, subscriber_topic, e
-        ),
+fn parse_edge(edge: &str) -> Option<(String, String)> {
+    let mut parts = edge.split('-');
+    let a = parts.next()?.to_string();
+    let b = parts.next()?.to_string();
+    if parts.next().is_some() {
+        return None;
     }
+    Some((a, b))
+}
+
+fn build_children_map(edges: &[String]) -> StdHashMap<String, Vec<String>> {
+    let mut out: StdHashMap<String, Vec<String>> = StdHashMap::new();
+    for e in edges {
+        if let Some((p, c)) = parse_edge(e) {
+            out.entry(p).or_default().push(c);
+        }
+    }
+    for v in out.values_mut() {
+        v.sort();
+        v.dedup();
+    }
+    out
+}
+
+fn try_atomic_update(redis_url: &str, key: &str, new_value: &str, old_value: &str) -> Result<bool, redis::RedisError> {
+    let client = redis::Client::open(redis_url)?;
+    let mut con = client.get_connection()?;
+    redis::cmd("WATCH").arg(key).query::<()>(&mut con)?;
+    let current: Option<String> = redis::cmd("GET").arg(key).query(&mut con)?;
+    let current = current.unwrap_or_default();
+    if current != old_value {
+        let _ = redis::cmd("UNWATCH").query::<()>(&mut con);
+        return Ok(false);
+    }
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    pipe.set(key, new_value);
+    let exec_result = pipe.query::<Option<Vec<redis::Value>>>(&mut con)?;
+    Ok(exec_result.is_some())
+}
+
+fn disconnect_from_routing(redis_url: &str, topic_gdp: &str, node: &str) {
+    let key = format!("{}-routing", topic_gdp);
+    for _ in 0..32 {
+        let client = match redis::Client::open(redis_url) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Redis open failed: {}", e);
+                return;
+            }
+        };
+        let mut con = match client.get_connection() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Redis connection failed: {}", e);
+                return;
+            }
+        };
+        let old: Option<String> = match redis::cmd("GET").arg(&key).query(&mut con) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Redis GET {} failed: {}", key, e);
+                return;
+            }
+        };
+        let old = old.unwrap_or_default();
+
+        let mut st: RoutingState = if old.trim().is_empty() {
+            RoutingState::default()
+        } else {
+            serde_json::from_str(&old).unwrap_or_default()
+        };
+        st.normalize();
+
+        let children = build_children_map(&st.edges);
+        let mut subtree = HashSet::<String>::new();
+        let mut q = VecDeque::<String>::new();
+        subtree.insert(node.to_string());
+        q.push_back(node.to_string());
+        while let Some(n) = q.pop_front() {
+            if let Some(ch) = children.get(&n) {
+                for c in ch {
+                    if subtree.insert(c.clone()) {
+                        q.push_back(c.clone());
+                    }
+                }
+            }
+        }
+
+        st.edges.retain(|e| {
+            let Some((p, c)) = parse_edge(e) else { return false };
+            !subtree.contains(&p) && !subtree.contains(&c)
+        });
+        // IMPORTANT (per plan): disconnect only detaches edges.
+        // Do NOT delete nodes from `publishers`/`proxies` registries here.
+        st.normalize();
+
+        let new_value = serde_json::to_string(&st).unwrap_or_else(|_| "{}".to_string());
+        match try_atomic_update(redis_url, &key, &new_value, &old) {
+            Ok(true) => {
+                println!("Disconnected node {} from topic {} (routing cleanup)", node, topic_gdp);
+                return;
+            }
+            Ok(false) => continue, // retry on conflict
+            Err(e) => {
+                eprintln!("Redis CAS update failed: {}", e);
+                return;
+            }
+        }
+    }
+    eprintln!("Routing cleanup retries exceeded for topic {} node {}", topic_gdp, node);
 }
 
 /// Handle a new WebSocket client connection.
@@ -172,7 +197,15 @@ async fn handle(clients: ClientsMap, stream: TcpStream) {
 
     // Create an unbounded channel to allow sending messages to this client
     let (tx, rx) = mpsc::unbounded();
-    clients.lock().unwrap().insert(client_id.clone(), tx);
+    // IMPORTANT: a client_id may reconnect while an old websocket is still winding down.
+    // If we overwrite the map entry, the old websocket's cleanup would remove the *new* entry,
+    // causing flapping. Use a generation counter so only the latest connection can remove itself.
+    let my_gen = {
+        let mut locked = clients.lock().unwrap();
+        let gen = locked.get(&client_id).map(|e| e.gen + 1).unwrap_or(1);
+        locked.insert(client_id.clone(), ClientEntry { gen, tx: tx.clone() });
+        gen
+    };
 
     // Split the WebSocket for reading and writing
     let (outgoing, incoming) = websocket.split();
@@ -189,10 +222,10 @@ async fn handle(clients: ClientsMap, stream: TcpStream) {
             // Parse the incoming JSON message
             let mut content = json::parse(text).unwrap();
             let remote_id = content["id"].to_string();
-            let mut locked = clients.lock().unwrap();
+            let locked = clients.lock().unwrap();
 
             // Find the target client and forward the message
-            match locked.get_mut(&remote_id) {
+            match locked.get(&remote_id) {
                 Some(remote) => {
                     // Overwrite "id" to identify the true sender
                     content.insert("id", client_id.clone()).unwrap();
@@ -200,7 +233,7 @@ async fn handle(clients: ClientsMap, stream: TcpStream) {
 
                     // Send the message to the target client
                     println!("Client {} >> {}", &remote_id, &text);
-                    remote.unbounded_send(Message::text(text)).unwrap();
+                    remote.tx.unbounded_send(Message::text(text)).unwrap();
                 }
                 None => eprintln!("ERROR: Client {} not found", &remote_id),
             }
@@ -214,8 +247,57 @@ async fn handle(clients: ClientsMap, stream: TcpStream) {
 
     // Cleanup on client disconnect
     println!("Client {} disconnected", &client_id);
-    clients.lock().unwrap().remove(&client_id);
-    remove_client_from_rib(&client_id);
+    {
+        let mut locked = clients.lock().unwrap();
+        // Only remove if we are still the latest generation for this client_id.
+        let should_remove = locked.get(&client_id).map(|e| e.gen == my_gen).unwrap_or(false);
+        if should_remove {
+            locked.remove(&client_id);
+        } else {
+            println!(
+                "Ignoring disconnect for stale generation: id={} gen={} (latest differs)",
+                client_id, my_gen
+            );
+        }
+    }
+
+    // IMPORTANT: the signaling server has ONE websocket per *edge endpoint*.
+    // A single websocket disconnect does NOT imply the node is gone; it may still have other edges.
+    //
+    // To avoid routing flapping, only call disconnect(self_node) when this was the *last*
+    // websocket for that (topic_gdp, self_node), and after a short debounce to allow reconnects.
+    let parts: Vec<&str> = client_id.split('-').collect();
+    if parts.len() != 3 {
+        eprintln!("Unexpected client_id format (expected topic-self-peer): {}", client_id);
+        return;
+    }
+    let topic_gdp = parts[0].to_string();
+    let self_node = parts[1].to_string();
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://fogros2-sgc-lite-rib-1".to_string());
+    let clients_for_check = clients.clone();
+
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let still_has_any = {
+            let locked = clients_for_check.lock().unwrap();
+            locked.keys().any(|id| {
+                let p: Vec<&str> = id.split('-').collect();
+                p.len() == 3 && p[0] == topic_gdp && p[1] == self_node
+            })
+        };
+        if still_has_any {
+            println!(
+                "Skip routing disconnect for topic {} node {} (other websockets still connected)",
+                topic_gdp, self_node
+            );
+            return;
+        }
+        println!(
+            "Routing disconnect for topic {} node {} (last websocket disconnected)",
+            topic_gdp, self_node
+        );
+        disconnect_from_routing(&redis_url, &topic_gdp, &self_node);
+    });
 }
 
 #[tokio::main]

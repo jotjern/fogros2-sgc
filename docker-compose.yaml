@@ -41,12 +41,9 @@ services:
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
         init: true
-        cap_add:
-          - NET_ADMIN
         command: >
-          bash -c "apt-get update -qq && apt-get install -qq -y iproute2;
-          source /opt/ros/humble/setup.bash; 
-          python3 /fog_ws/benchmark_code/fogros2_examples/talker_throughput.py & 
+          bash -c "source /opt/ros/humble/setup.bash; 
+          ros2 run demo_nodes_py talker & 
           /gdp-router router"
     listener:
         restart: always
@@ -64,12 +61,14 @@ services:
           SGC_CONFIG: "listener-docker.toml"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
+        # TODO: this is a hack to make sure the subscriber is started after the publisher
+        # will also test the scenario that is opposite
         init: true
         command: >
           bash -c "source /opt/ros/humble/setup.bash; 
           ros2 run demo_nodes_py listener & 
           /gdp-router router"
-    proxy1:
+    proxy:
         restart: always
         build: 
           context: ./
@@ -90,48 +89,7 @@ services:
         command: >
           bash -c "source /opt/ros/humble/setup.bash; 
           /gdp-router router"
-    proxy2:
-        restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
-        volumes:
-          - "./src:/src" 
-          - "./scripts:/scripts" 
-        depends_on:
-          - rib
-          - signal
-        environment:
-          SGC_CONFIG: "proxy-docker.toml"
-          RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
-          CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
-        # TODO: this is a hack to make sure the subscriber is started after the publisher
-        # will also test the scenario that is opposite
-        init: true
-        command: >
-          bash -c "source /opt/ros/humble/setup.bash; 
-          /gdp-router router"
-    proxy3:
-        restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
-        volumes:
-          - "./src:/src" 
-          - "./scripts:/scripts" 
-        depends_on:
-          - rib
-          - signal
-        environment:
-          SGC_CONFIG: "proxy-docker.toml"
-          RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
-          CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
-        # TODO: this is a hack to make sure the subscriber is started after the publisher
-        # will also test the scenario that is opposite
-        init: true
-        command: >
-          bash -c "source /opt/ros/humble/setup.bash; 
-          /gdp-router router"
+
     dashboard:
         restart: always
         image: node:18-alpine

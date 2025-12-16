@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
-
 use futures::StreamExt;
-use redis::{self, transaction, Client, Commands, RedisResult};
+use log::{error, info};
+use redis::{self, Client, Commands, RedisResult};
 use redis_async::client;
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use utils::app_config::AppConfig;
+use crate::structs::GDPName;
 
 // Get Redis URL for RIB (Routing Information Base)
 pub fn get_redis_url() -> String {
@@ -36,50 +36,76 @@ pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut con = client
         .get_connection()
         .map_err(|e| format!("Failed to get Redis connection: {}", e))?;
-    let publisher_topic = format!("{}-pub", topic);
-    let subscriber_topic = format!("{}-sub", topic);
-
-    redis::cmd("DEL")
-        .arg(&publisher_topic)
-        .execute(&mut con);
-    redis::cmd("DEL")
-        .arg(&subscriber_topic)
-        .execute(&mut con);
-    info!("Cleared Redis keys for topic: {} (pub: {}, sub: {})", topic, publisher_topic, subscriber_topic);
+    // Clear both the current routing key and any legacy keys from older designs.
+    let keys = [
+        format!("{}-routing", topic),
+        format!("{}-publishers", topic),
+        format!("{}-proxies", topic),
+        format!("{}-connections", topic),
+        format!("{}-pub", topic),
+        format!("{}-sub", topic),
+    ];
+    for k in &keys {
+        redis::cmd("DEL").arg(k).query::<()>(&mut con)?;
+    }
+    info!("Cleared Redis topic keys for topic: {}", topic);
     Ok(())
 }
 
-// Atomically add publisher/subscriber to Redis list (thread-safe)
-pub fn add_entity_to_database_as_transaction(
-    redis_url: &str, key: &str, value: &str,
-) -> RedisResult<()> {
+// -----------------------------------------------------------------------------
+// Redis optimistic CAS helpers (WATCH/MULTI/EXEC)
+// -----------------------------------------------------------------------------
+
+/// Try a single optimistic compare-and-swap update for a single Redis key.
+///
+/// Returns:
+/// - `Ok(true)` if the update committed
+/// - `Ok(false)` if the observed value did not match `old_value` or a concurrent writer won
+pub fn try_atomic_update(
+    redis_url: &str,
+    key: &str,
+    new_value: &str,
+    old_value: &str,
+) -> RedisResult<bool> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
-    let (list_length,): (isize,) = transaction(&mut con, &[key], |con, pipe| {
-        pipe.lpush(key, value).query(con)
-    })?;
-    info!("Added entity '{}' to '{}', list length: {}", value, key, list_length);
-    Ok(())
+
+    redis::cmd("WATCH").arg(key).query::<()>(&mut con)?;
+    let current: Option<String> = con.get(key)?;
+    let current = current.unwrap_or_default();
+    if current != old_value {
+        let _ = redis::cmd("UNWATCH").query::<()>(&mut con);
+        return Ok(false);
+    }
+
+    let mut pipe = redis::pipe();
+    pipe.atomic();
+    pipe.set(key, new_value);
+    // If watched key changed, Redis returns Nil -> Option::None.
+    let exec_result = pipe.query::<Option<Vec<redis::Value>>>(&mut con)?;
+    Ok(exec_result.is_some())
 }
 
-pub fn remove_entity_from_database_as_transaction(
-    redis_url: &str, key: &str, value: &str,
-) -> RedisResult<()> {
-    let client = Client::open(redis_url)?;
-    let mut con = client.get_connection()?;
-    let (removed_count,): (isize,) = transaction(&mut con, &[key], |con, pipe| {
-        pipe.lrem(key, 1, value).query(con)
-    })?;
-    info!("Removed {} instance(s) of '{}' from '{}'", removed_count, value, key);
-    Ok(())
+/// Retry optimistic CAS up to `max_retries`.
+pub fn atomic_update(
+    redis_url: &str,
+    key: &str,
+    new_value: &str,
+    old_value: &str,
+    max_retries: usize,
+) -> RedisResult<bool> {
+    for _ in 0..max_retries {
+        if try_atomic_update(redis_url, key, new_value, old_value)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
-// Get all publishers/subscribers from Redis list
-pub fn get_entity_from_database(redis_url: &str, key: &str) -> RedisResult<Vec<String>> {
+pub fn get_string(redis_url: &str, key: &str) -> RedisResult<Option<String>> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
-    let list: Vec<String> = con.lrange(key, 0, -1)?;
-    Ok(list)
+    con.get(key)
 }
 
 // Enable Redis keyspace notifications for dynamic discovery
@@ -91,7 +117,7 @@ pub fn allow_keyspace_notification(redis_url: &str) -> RedisResult<()> {
         .arg("SET")
         .arg("notify-keyspace-events")
         .arg("KEA")
-        .query(&mut con)
+        .query::<()>(&mut con)
         .map_err(|e| {
             redis::RedisError::from((
                 redis::ErrorKind::IoError,
@@ -103,12 +129,15 @@ pub fn allow_keyspace_notification(redis_url: &str) -> RedisResult<()> {
     Ok(())
 }
 
-pub enum RedisListChange {
-    Added(String),
-    Removed(String),
+/// A keyspace notification for a key change (we don't interpret the event type here).
+#[derive(Debug, Clone)]
+pub struct RedisKeyChange {
+    pub key: String,
+    pub event: String,
 }
 
-pub async fn watch_redis_list_items(list_key: String) -> UnboundedReceiver<RedisListChange> {
+/// Watch a Redis key and emit an event on any keyspace notification.
+pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
     let redis_url = get_redis_url();
     if let Err(e) = allow_keyspace_notification(&redis_url) {
         error!("Failed to enable keyspace notifications: {}", e);
@@ -134,7 +163,7 @@ pub async fn watch_redis_list_items(list_key: String) -> UnboundedReceiver<Redis
         }
     };
 
-    let keyspace_topic = format!("__keyspace@0__:{}", list_key);
+    let keyspace_topic = format!("__keyspace@0__:{}", key);
     let mut stream = match pubsub.psubscribe(&keyspace_topic).await {
         Ok(s) => s,
         Err(e) => {
@@ -146,36 +175,18 @@ pub async fn watch_redis_list_items(list_key: String) -> UnboundedReceiver<Redis
     };
 
     let (tx, rx) = unbounded_channel();
-    let mut known_items = HashSet::<String>::new();
 
     tokio::spawn(async move {
         while !tx.is_closed() {
-            let items: HashSet<String> = get_entity_from_database(&redis_url, &list_key)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-
-            for item in &items {
-                if known_items.insert(item.clone()) {
-                    let _ = tx.send(RedisListChange::Added(item.clone()));
-                }
-            }
-
-            let to_remove: Vec<String> = known_items
-                .iter()
-                .filter(|item| !items.contains(*item))
-                .cloned()
-                .collect();
-
-            for item in to_remove {
-                known_items.remove(&item);
-                let _ = tx.send(RedisListChange::Removed(item));
-            }
-
             // Wait for a notification from the redis server
             loop {
                 match stream.next().await {
-                    Some(Ok(_)) => break,
+                    Some(Ok(_msg)) => {
+                        // We only need a wake-up signal to re-fetch state.
+                        // Keep this compatible across redis_async message types.
+                        let _ = tx.send(RedisKeyChange { key: key.clone(), event: "changed".to_string() });
+                        break;
+                    }
                     Some(Err(e)) => error!("Error when waiting for redis updates: {}", e),
                     None => (),
                 }
@@ -186,106 +197,30 @@ pub async fn watch_redis_list_items(list_key: String) -> UnboundedReceiver<Redis
     rx
 }
 
-/// Register a GDP name as a publisher for a topic in Redis.
-pub fn register_publisher(
-    redis_url: &str,
-    topic_gdp: crate::structs::GDPName,
-    gdp_name: crate::structs::GDPName,
-    topic_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let publishers_key = format!("{}-publishers", topic_gdp);
-    add_entity_to_database_as_transaction(redis_url, &publishers_key, &gdp_name.to_string())
-        .map_err(|e| format!("Failed to register as publisher: {}", e))?;
-    info!("Registered as publisher for topic: {} (GDP: {})", topic_name, topic_gdp);
-    Ok(())
-}
+// -----------------------------------------------------------------------------
+// (Removed) list-based RIB helpers.
+//
+// Routing state is now a single `{topic}-routing` JSON value and is managed by
+// `routing.rs` using `try_atomic_update`/`atomic_update`.
+// -----------------------------------------------------------------------------
 
-/// Get Docker container name. Panics if not available.
+// -----------------------------------------------------------------------------
+// GDP name -> container name mapping (used by topic_manager.rs)
+// -----------------------------------------------------------------------------
+
 pub fn get_container_name() -> String {
-    if let Ok(name) = std::env::var("CONTAINER_NAME") {
-        if !name.is_empty() {
-            return name;
-        }
-    }
-    
-    if let Ok(hostname) = std::env::var("HOSTNAME") {
-        if !hostname.is_empty() {
-            return hostname;
-        }
-    }
-    
-    if let Ok(contents) = std::fs::read_to_string("/etc/hostname") {
-        let trimmed = contents.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    
-    panic!(
-        "CRITICAL: Cannot determine container name! \
-        Checked CONTAINER_NAME env var, HOSTNAME env var, and /etc/hostname file. \
-        Container name is required for GDP name mapping. \
-        This is a configuration error that must be fixed."
-    );
+    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Publish GDP name -> Docker container name mapping to Redis.
-/// Uses a hash map structure for efficient lookups.
 pub fn publish_gdp_name_mapping(
     redis_url: &str,
-    gdp_name: crate::structs::GDPName,
+    gdp_name: GDPName,
     container_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mapping_key = format!("gdp-name-mapping:{}", gdp_name.to_string());
-    add_entity_to_database_as_transaction(redis_url, &mapping_key, container_name)
-        .map_err(|e| format!("Failed to publish GDP name mapping: {}", e))?;
-    info!("Published GDP name mapping: {} -> {}", gdp_name.to_string(), container_name);
-    Ok(())
-}
-
-/// Get container name for a specific GDP name.
-pub fn get_container_name_for_gdp(redis_url: &str, gdp_name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mapping_key = format!("gdp-name-mapping:{}", gdp_name);
-    let mappings = get_entity_from_database(redis_url, &mapping_key)?;
-    Ok(mappings.first().cloned())
-}
-
-/// Get all GDP name -> container name mappings from Redis.
-pub fn get_gdp_name_mappings(redis_url: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+) -> RedisResult<()> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
-    
-    // Get all keys matching the pattern
-    let pattern = "gdp-name-mapping:*";
-    let keys: Vec<String> = con.keys(pattern)?;
-    
-    let mut result = HashMap::new();
-    for key in keys {
-        // Extract GDP name from key (format: "gdp-name-mapping:XXXX")
-        if let Some(gdp_name) = key.strip_prefix("gdp-name-mapping:") {
-            let container_names: Vec<String> = con.lrange(&key, 0, -1)?;
-            if let Some(container_name) = container_names.first() {
-                result.insert(gdp_name.to_string(), container_name.clone());
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// Register a GDP name as a proxy for a topic in Redis.
-/// Proxies advertise themselves but do not automatically connect to publishers.
-pub fn register_proxy(
-    redis_url: &str,
-    topic_gdp: crate::structs::GDPName,
-    gdp_name: crate::structs::GDPName,
-    topic_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let proxy_key = format!("{}-proxies", topic_gdp);
-    
-    // Register proxy in Redis
-    add_entity_to_database_as_transaction(redis_url, &proxy_key, &gdp_name.to_string())
-        .map_err(|e| format!("Failed to register as proxy: {}", e))?;
-    info!("Registered as proxy (GDP: {}) for topic {}", gdp_name, topic_name);
-    
+    // Keep this simple: a single Redis hash for lookups/debugging.
+    let key = "gdpname_map";
+    let _: () = con.hset(key, gdp_name.to_string(), container_name)?;
     Ok(())
 }

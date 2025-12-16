@@ -172,6 +172,10 @@
       background: #ff6b6b;
     }
 
+    .legend-color.subscriber {
+      background: #a78bfa;
+    }
+
     .stats-item {
       display: flex;
       justify-content: space-between;
@@ -302,6 +306,10 @@
           <div class="legend-color proxy"></div>
           <span>Proxy</span>
         </div>
+        <div class="legend-item">
+          <div class="legend-color subscriber"></div>
+          <span>Subscriber</span>
+        </div>
       </div>
 
       <div class="stats">
@@ -404,6 +412,57 @@
       initGraph();
     });
 
+    // ------------------------------------------------------------
+    // Client-side error logging (send to server + keep console).
+    // ------------------------------------------------------------
+    let lastClientErrorAt = 0;
+    function reportClientError(payload) {
+      const now = Date.now();
+      // simple rate limit to avoid infinite loops
+      if (now - lastClientErrorAt < 1000) return;
+      lastClientErrorAt = now;
+      try {
+        socket.emit('client-error', payload);
+      } catch (_) {}
+
+      // If we ever see the legacy `.split` crash, it means the browser is running stale cached JS/HTML.
+      // Force a one-time cache-busting reload to guarantee the latest script is loaded.
+      try {
+        const msg = (payload && payload.message) ? String(payload.message) : '';
+        if (msg.includes('split is not a function')) {
+          const key = 'dashboard_forced_reload_v1';
+          if (!sessionStorage.getItem(key)) {
+            sessionStorage.setItem(key, '1');
+            const base = window.location.origin + window.location.pathname;
+            window.location.replace(`${base}?v=${Date.now()}`);
+          }
+        }
+      } catch (_) {}
+    }
+
+    window.addEventListener('error', (event) => {
+      const err = event.error;
+      reportClientError({
+        type: 'error',
+        message: (err && err.message) ? err.message : String(event.message || 'Unknown error'),
+        stack: (err && err.stack) ? err.stack : null,
+        source: event.filename || null,
+        lineno: event.lineno || null,
+        colno: event.colno || null,
+        userAgent: navigator.userAgent
+      });
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      const reason = event.reason;
+      reportClientError({
+        type: 'unhandledrejection',
+        message: (reason && reason.message) ? reason.message : String(reason || 'Unhandled rejection'),
+        stack: (reason && reason.stack) ? reason.stack : null,
+        userAgent: navigator.userAgent
+      });
+    });
+
     const pendingFlashes = [];
     socket.on('debug-event', (evt) => {
       if (!evt || !evt.node) return;
@@ -422,6 +481,12 @@
       elements.status.className = 'status disconnected';
       document.getElementById('disconnectedOverlay').classList.remove('hidden');
       scheduleReconnect();
+      // Ask server for detailed error log (if available)
+      socket.emit('get-last-error');
+    });
+
+    socket.on('server-error', (err) => {
+      console.error('[Dashboard] server-error', err);
     });
 
     socket.on('disconnect', () => {
@@ -475,18 +540,20 @@
       const links = [];
       const nodeSet = new Set();
       const proxySet = new Set(data.proxies || []);
-      const publisherSet = new Set();
+      const publisherSet = new Set(data.publishers || []);
+      const subscriberSet = new Set(data.subscribers || []);
       const gdpMappings = data.gdpMappings || {};
       const unconnectedSet = new Set(data.unconnectedNodes || []);
       const distressedSet = new Set(data.distressedNodes || []);
 
-      // First pass: identify publishers from connection sources
-      data.connections.forEach(conn => {
-        const parts = conn.split(',');
-        if (parts.length === 3 && parts[0]) {
-          publisherSet.add(parts[0]);
-        }
-      });
+      // If backend didn't provide publishers/subscribers, infer from edges.
+      if (publisherSet.size === 0 || subscriberSet.size === 0) {
+        (data.connections || []).forEach(conn => {
+          if (!conn || typeof conn !== 'object') return;
+          if (conn.source) publisherSet.add(conn.source);
+          if (conn.target) subscriberSet.add(conn.target);
+        });
+      }
 
       const addNode = (id) => {
         if (nodeSet.has(id)) return;
@@ -494,7 +561,9 @@
           ? 'proxy'
           : publisherSet.has(id)
             ? 'publisher'
-            : 'other';
+            : subscriberSet.has(id)
+              ? 'subscriber'
+              : 'other';
         const containerName = gdpMappings[id] || null;
         const isUnconnected = unconnectedSet.has(id);
         const isDistressed = distressedSet.has(id);
@@ -505,15 +574,13 @@
       (data.nodes || []).forEach(addNode);
       (data.proxies || []).forEach(addNode);
 
-      data.connections.forEach(conn => {
-        const parts = conn.split(',');
-        if (parts.length === 3) {
-          const [source, topic, target] = parts;
-          addNode(source);
-          addNode(target);
-
-          links.push({ source, target, topic, id: `${source}-${target}-${topic}` });
-        }
+      (data.connections || []).forEach(conn => {
+        if (!conn || typeof conn !== 'object') return;
+        const { source, topic, target } = conn;
+        if (!source || !target || !topic) return;
+        addNode(source);
+        addNode(target);
+        links.push({ source, target, topic, id: `${source}-${target}-${topic}` });
       });
 
       const oldNodeMap = new Map(graphData.nodes.map(n => [n.id, n]));
@@ -684,6 +751,7 @@
             return d.isDistressed ? '#cc0000' : '#ff6b6b';
           }
           if (d.type === 'publisher') return '#4ecdc4';
+          if (d.type === 'subscriber') return '#a78bfa';
           return '#5c7cfa';
         })
         .attr('opacity', d => d.isUnconnected ? 0.6 : 1.0)

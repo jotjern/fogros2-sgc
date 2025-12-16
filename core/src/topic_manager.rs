@@ -1,8 +1,8 @@
-use crate::connection_store::{connection_id, is_node_involved, parse_connection, topic_redis_keys, watch_topic_connections};
-use crate::db::{get_redis_url, register_proxy, register_publisher, RedisListChange};
+use crate::connection_store::{connection_id, is_node_involved, parse_connection};
+use crate::db::{get_redis_url, watch_redis_key, RedisKeyChange};
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
-use crate::routing::{attach_subscriber_to_publisher, handle_own_distress, make_proxy_publisher, update_own_distress_status};
+use crate::routing::{current_connections, register_proxy, register_publisher, subscribe};
 use crate::structs::{Connection, GDPName, generate_random_gdp_name, get_gdp_name_from_topic};
 
 use std::collections::HashMap;
@@ -118,10 +118,9 @@ async fn handle_connection_added(
     topic_gdp: GDPName,
     my_gdp_name: GDPName,
     connections: &mut HashMap<String, broadcast::Sender<()>>,
-    redis_url: &str,
+    _redis_url: &str,
     is_publisher: bool,
     is_proxy: bool,
-    local_publisher_connection_count: &mut usize,
 ) -> bool {
     let connection = match parse_connection(&connection_string) {
         Some(c) => c,
@@ -145,18 +144,8 @@ async fn handle_connection_added(
     connections.insert(conn_id.clone(), shutdown_tx);
     info!("Successfully established connection: {}", conn_id);
     
-    // If this node is the publisher, increment local connection count
     let is_this_node_publisher = connection.publisher == my_gdp_name;
-    if is_this_node_publisher && (is_publisher || is_proxy) {
-        *local_publisher_connection_count += 1;
-    }
-    
-    // If this node is a proxy and just connected to a publisher, make it a publisher too
-    if is_proxy && connection.subscriber == my_gdp_name {
-        if let Err(e) = make_proxy_publisher(redis_url, topic_gdp, topic_name, my_gdp_name) {
-            error!("Failed to make proxy {} a publisher: {}", my_gdp_name, e);
-        }
-    }
+    let _ = (is_publisher, is_proxy);
     
     is_this_node_publisher
 }
@@ -172,7 +161,6 @@ fn handle_connection_removed(
     my_gdp_name: GDPName,
     is_publisher: bool,
     is_proxy: bool,
-    local_publisher_connection_count: &mut usize,
 ) -> bool {
     let connection = match parse_connection(&connection_string) {
         Some(c) => c,
@@ -186,11 +174,8 @@ fn handle_connection_removed(
     }
     info!("Connection removed from {}: {}", connections_topic, connection_string);
     
-    // If this node was the publisher, decrement local connection count
     let is_this_node_publisher = connection.publisher == my_gdp_name;
-    if is_this_node_publisher && (is_publisher || is_proxy) && *local_publisher_connection_count > 0 {
-        *local_publisher_connection_count -= 1;
-    }
+    let _ = (is_publisher, is_proxy);
     
     is_this_node_publisher
 }
@@ -202,58 +187,105 @@ async fn manage_topic_connections(
     is_publisher: bool, is_proxy: bool,
 ) {
     let topic_gdp = GDPName(get_gdp_name_from_topic(&topic_name, &topic_type, &certificate));
-    let (_, connections_key, _, _) = topic_redis_keys(topic_gdp);
     let redis_url = get_redis_url();
+    let routing_key = format!("{}-routing", topic_gdp);
 
     info!("Managing connections for topic {} (GDP: {})", topic_name, topic_gdp);
 
-    let mut connection_changes = watch_topic_connections(topic_gdp).await;
+    let mut routing_changes = watch_redis_key(routing_key.clone()).await;
     let mut connections: HashMap<String, broadcast::Sender<()>> = HashMap::new();
-    
-    // Track local connection count for this node as a publisher
-    let mut local_publisher_connection_count = 0;
+    let mut current_edge_set: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    while let Some(event) = connection_changes.recv().await {
-        match event {
-            RedisListChange::Added(connection_string) => {
-                info!("New connection detected: {}", connection_string);
-                let was_publisher = handle_connection_added(
-                    connection_string, &topic_name, &topic_type, &certificate,
-                    topic_gdp, my_gdp_name, &mut connections, &redis_url,
-                    is_publisher, is_proxy, &mut local_publisher_connection_count,
-                ).await;
-                
-                // Update distress status if this node is the publisher
-                if was_publisher && (is_publisher || is_proxy) {
-                    if let Err(e) = update_own_distress_status(
-                        &redis_url,
-                        topic_gdp,
-                        my_gdp_name,
-                        local_publisher_connection_count,
-                        is_proxy,
-                    ) {
-                        error!("Failed to update own distress status: {}", e);
-                    }
-                }
+    // Initial reconcile (in case the key already exists).
+    let _ = routing_changes.try_recv();
+
+    while let Some(RedisKeyChange { key: _, event: _ }) = routing_changes.recv().await {
+        let all = match current_connections(&redis_url, topic_gdp) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to read routing state for topic {}: {}", topic_name, e);
+                continue;
             }
-            RedisListChange::Removed(connection_string) => {
-                let was_publisher = handle_connection_removed(
-                    connection_string, topic_gdp, &connections_key, &mut connections, &redis_url,
-                    my_gdp_name, is_publisher, is_proxy, &mut local_publisher_connection_count,
-                );
-                
-                // Update distress status if this node is the publisher
-                if was_publisher && (is_publisher || is_proxy) {
-                    if let Err(e) = update_own_distress_status(
-                        &redis_url,
-                        topic_gdp,
-                        my_gdp_name,
-                        local_publisher_connection_count,
-                        is_proxy,
-                    ) {
-                        error!("Failed to update own distress status: {}", e);
-                    }
-                }
+        };
+
+        // Keep a copy of full routing edges for rejoin decisions below.
+        let all_edges = all;
+
+        let relevant: Vec<Connection> = all_edges
+            .iter()
+            .cloned()
+            .filter(|c| is_node_involved(c, my_gdp_name))
+            .collect();
+
+        let mut new_edge_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for c in &relevant {
+            new_edge_set.insert(c.to_string());
+        }
+
+        // Removed edges
+        for removed in current_edge_set.difference(&new_edge_set).cloned().collect::<Vec<_>>() {
+            let _ = handle_connection_removed(
+                removed.clone(),
+                topic_gdp,
+                &routing_key,
+                &mut connections,
+                &redis_url,
+                my_gdp_name,
+                is_publisher,
+                is_proxy,
+            );
+        }
+
+        // Added edges
+        for added in new_edge_set.difference(&current_edge_set).cloned().collect::<Vec<_>>() {
+            let _was_publisher = handle_connection_added(
+                added,
+                &topic_name,
+                &topic_type,
+                &certificate,
+                topic_gdp,
+                my_gdp_name,
+                &mut connections,
+                &redis_url,
+                is_publisher,
+                is_proxy,
+            )
+            .await;
+        }
+
+        current_edge_set = new_edge_set;
+
+        // -------------------------------------------------------------
+        // Re-join policy (prevents flapping during atomic moves):
+        //
+        // Only re-subscribe if, in the *current* routing state, we have
+        // NO parent edge (i.e. no inbound connection to `my_gdp_name`).
+        // Do NOT re-subscribe just because one particular edge was removed;
+        // graft/move operations remove+add edges in the same atomic update.
+        // -------------------------------------------------------------
+        let has_parent_now = all_edges.iter().any(|c| c.subscriber == my_gdp_name);
+        let has_children_now = all_edges.iter().any(|c| c.publisher == my_gdp_name);
+
+        if !has_parent_now {
+            // Listener: ensure exactly one inbound parent edge exists.
+            if !is_publisher && !is_proxy {
+                tokio::spawn(attach_as_subscriber(
+                    redis_url.clone(),
+                    topic_gdp,
+                    topic_name.clone(),
+                    my_gdp_name,
+                ));
+            }
+
+            // Proxy: only attempt to rejoin if we currently have downstream children,
+            // meaning we are acting as an intermediate and must have an upstream parent.
+            if is_proxy && has_children_now {
+                let redis_url_for_retry = redis_url.clone();
+                let topic_name_for_retry = topic_name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = subscribe(&redis_url_for_retry, topic_gdp, &topic_name_for_retry, my_gdp_name);
+                });
             }
         }
     }
@@ -272,19 +304,8 @@ async fn attach_as_subscriber(
         + (rand::thread_rng().gen::<u64>() % SUBSCRIBER_ATTACH_RANDOM_DELAY_MS);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
     
-    let (publishers_key, connections_key, proxy_key, _) = topic_redis_keys(topic_gdp);
-    match attach_subscriber_to_publisher(
-        &redis_url,
-        &connections_key,
-        &publishers_key,
-        &proxy_key,
-        &topic_name,
-        my_gdp_name,
-    ) {
-        Ok(false) | Err(_) => {
-            error!("Failed to attach as subscriber for topic {}", topic_name);
-        }
-        Ok(true) => {}
+    if let Err(e) = subscribe(&redis_url, topic_gdp, &topic_name, my_gdp_name) {
+        error!("Failed to subscribe for topic {}: {}", topic_name, e);
     }
 }
 
@@ -314,11 +335,6 @@ fn setup_topic(
         "pub" => {
             if let Err(e) = register_publisher(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as publisher: {}", e);
-            } else {
-                // Spawn distress handler for this publisher
-                let redis_url_for_distress = redis_url.clone();
-                let topic_name_for_distress = topic_name.clone();
-                tokio::spawn(handle_own_distress(redis_url_for_distress, topic_gdp, topic_name_for_distress, my_gdp_name));
             }
         }
         "sub" => {
@@ -329,11 +345,6 @@ fn setup_topic(
         "proxy" => {
             if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Error registering as proxy: {}", e);
-            } else {
-                // Spawn distress handler for this proxy (proxies can also be publishers)
-                let redis_url_for_distress = redis_url.clone();
-                let topic_name_for_distress = topic_name.clone();
-                tokio::spawn(handle_own_distress(redis_url_for_distress, topic_gdp, topic_name_for_distress, my_gdp_name));
             }
         }
         "noop" => {}

@@ -95,7 +95,7 @@ services:
         working_dir: /app
         volumes:
           - ./dashboard:/app
-        command: ["npm", "start"]
+        command: ["sh", "-c", "npm install && npm start"]
         ports:
           - '3000:3000'
         depends_on:

@@ -39,7 +39,7 @@ pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut con = client
         .get_connection()
         .map_err(|e| format!("Failed to get Redis connection: {}", e))?;
-    // Clear both the current routing key and any legacy keys from older designs.
+    // Clear all topic-related keys
     let keys = [
         format!("{}-routing", topic),
         format!("{}-publishers", topic),
@@ -199,17 +199,6 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
 
     rx
 }
-
-// -----------------------------------------------------------------------------
-// (Removed) list-based RIB helpers.
-//
-// Routing state is now a single `{topic}-routing` JSON value and is managed by
-// `routing.rs` using `try_atomic_update`/`atomic_update`.
-// -----------------------------------------------------------------------------
-
-// -----------------------------------------------------------------------------
-// GDP name -> container name mapping (used by topic_manager.rs)
-// -----------------------------------------------------------------------------
 
 pub fn get_container_name() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())

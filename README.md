@@ -43,7 +43,7 @@ The following are instructions of building FogROS2 SGC.
 ### Install dependencies 
 ```
 sudo apt update
-sudo apt install build-essential curl pkg-config libssl-dev protobuf-compiler clang
+sudo apt install build-essential curl pkg-config libssl-dev clang
 ```
 
 #### Install Rust 

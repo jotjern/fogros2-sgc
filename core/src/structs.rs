@@ -1,86 +1,49 @@
-use anyhow::{anyhow, Result};
+//! Core data structures for the Global Data Plane (GDP) protocol.
+//!
+//! GDPName: A 4-byte identifier derived from SHA256(topic_name, topic_type, certificate).
+//! This ensures nodes with matching credentials get the same topic ID without coordination.
+//!
+//! GDPPacket: The unit of data transfer. Contains action, destination, source, and payload.
+//! Serialized as JSON header + null byte + binary payload for WebRTC transport.
+
 use rand::Rng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::num::ParseIntError;
 use std::str::FromStr;
 use strum_macros::EnumIter;
-use tokio::sync::mpsc::UnboundedSender;
-pub const MAGIC_NUMBERS: u16 = u16::from_be_bytes([0x26, 0x2a]);
 
-pub type GdpName = [u8; 32];
-use serde::{Deserialize, Serialize};
-
-// Actions for GDP packets in the routing protocol
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, EnumIter)]
+/// Actions that can be performed on GDP packets.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Serialize, Deserialize, Hash, EnumIter, Default)]
 pub enum GdpAction {
+    #[default]
     Noop = 0,
-    Forward = 1,
-    Advertise = 2,
+    Forward = 1,      // Forward payload to destination
+    Advertise = 2,    // Announce topic availability
     AdvertiseResponse = 3,
-    RibGet = 4,
+    RibGet = 4,       // Query routing information
     RibReply = 5,
     Nack = 6,
     Control = 7,
 }
 
-impl Default for GdpAction {
-    fn default() -> Self {
-        GdpAction::Noop
-    }
-}
-
-impl TryFrom<u8> for GdpAction {
-    type Error = anyhow::Error;
-
-    fn try_from(v: u8) -> Result<Self> {
-        match v {
-            x if x == GdpAction::Noop as u8 => Ok(GdpAction::Noop),
-            x if x == GdpAction::RibGet as u8 => Ok(GdpAction::RibGet),
-            x if x == GdpAction::RibReply as u8 => Ok(GdpAction::RibReply),
-            x if x == GdpAction::Forward as u8 => Ok(GdpAction::Forward),
-            x if x == GdpAction::Nack as u8 => Ok(GdpAction::Nack),
-            x if x == GdpAction::Control as u8 => Ok(GdpAction::Control),
-            x if x == GdpAction::AdvertiseResponse as u8 => Ok(GdpAction::AdvertiseResponse),
-            unknown => Err(anyhow!("Unknown action byte ({:?})", unknown)),
-        }
-    }
-}
-
-#[allow(non_camel_case_types)]
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C, packed)]
-pub struct u16be(u16);
-
-impl From<u16> for u16be {
-    fn from(item: u16) -> Self {
-        u16be(u16::to_be(item))
-    }
-}
-
-impl From<u16be> for u16 {
-    fn from(item: u16be) -> Self {
-        u16::from_be(item.0)
-    }
-}
-
-// 4-byte (256 bit) unique identifier for topics/nodes, derived from hash(topic_name, topic_type, certificate)
+/// 4-byte unique identifier for topics/nodes.
+/// Derived from SHA256(topic_name, topic_type, cert)[0..4].
+/// Same inputs always produce the same GDPName across all nodes.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Deserialize, Hash, Default)]
 pub struct GDPName(pub [u8; 4]);
+
 impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "{:02x}{:02x}{:02x}{:02x}",
-            self.0[0], self.0[1], self.0[2], self.0[3]
-        )?;
-        Ok(())
+        write!(f, "{:02x}{:02x}{:02x}{:02x}", self.0[0], self.0[1], self.0[2], self.0[3])
     }
 }
 
 impl FromStr for GDPName {
     type Err = ParseIntError;
 
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut bytes = [0u8; 4];
         for (i, chunk) in s.as_bytes().chunks(2).take(4).enumerate() {
             if let Ok(chunk_str) = std::str::from_utf8(chunk) {
@@ -92,7 +55,6 @@ impl FromStr for GDPName {
 }
 
 pub fn generate_random_gdp_name() -> GDPName {
-    // u8:4
     GDPName([
         rand::thread_rng().gen(),
         rand::thread_rng().gen(),
@@ -101,33 +63,45 @@ pub fn generate_random_gdp_name() -> GDPName {
     ])
 }
 
-pub(crate) trait Packet {
-    /// get protobuf object of the packet
-    /// get serialized byte array of the packet
-    fn get_byte_payload(&self) -> Option<&Vec<u8>>;
-
-    fn get_header(&self) -> GDPHeaderInTransit;
+/// Generate deterministic GDPName from topic metadata.
+/// Nodes with the same topic_name, topic_type, and certificate get the same GDPName.
+pub fn get_gdp_name_from_topic(topic_name: &str, topic_type: &str, cert: &[u8]) -> [u8; 4] {
+    let mut hasher = Sha256::new();
+    info!(
+        "Name is generated from topic_name: {}, topic_type: {}, cert: (too long, not printed)",
+        topic_name, topic_type
+    );
+    hasher.update(topic_name);
+    hasher.update(topic_type);
+    hasher.update(cert);
+    let result = hasher.finalize();
+    
+    let mut bytes = [0u8; 4];
+    bytes.copy_from_slice(&result[..4]);
+    bytes
 }
 
-// Main packet structure for sending ROS messages over WebRTC
+/// Main packet structure for ROS message transport over WebRTC.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct GDPPacket {
     pub action: GdpAction,
-    pub gdpname: GDPName,
-    // the payload can be either (both)
-    // Vec u8 bytes or protobuf
-    // converting back and forth between proto and u8 is expensive
-    // preferably forward directly without conversion
+    pub gdpname: GDPName,      // Destination
+    pub source: GDPName,
     pub payload: Option<Vec<u8>>,
     pub name_record: Option<GDPNameRecord>,
-    pub source: GDPName,
 }
 
+/// Wire format header. Sent as JSON followed by null byte, then binary payload.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone, Copy)]
 pub struct GDPHeaderInTransit {
     pub action: GdpAction,
     pub destination: GDPName,
-    pub length: usize,
+    pub length: usize,         // Length of payload that follows
+}
+
+pub(crate) trait Packet {
+    fn get_byte_payload(&self) -> Option<&Vec<u8>>;
+    fn get_header(&self) -> GDPHeaderInTransit;
 }
 
 impl Packet for GDPPacket {
@@ -136,134 +110,67 @@ impl Packet for GDPPacket {
     }
 
     fn get_header(&self) -> GDPHeaderInTransit {
-        let name_record_length = match &self.name_record {
-            Some(name_record) => serde_json::to_string(&name_record)
-                .unwrap()
-                .as_bytes()
-                .len(),
-            None => 0,
-        };
-        let transit_packet = match &self.payload {
-            Some(payload) => GDPHeaderInTransit {
-                action: self.action,
-                destination: self.gdpname,
-                length: payload.len() + name_record_length,
-            },
-            None => {
-                GDPHeaderInTransit {
-                    action: self.action,
-                    destination: self.gdpname,
-                    length: name_record_length, // doesn't have any payload
-                }
-            }
-        };
-        // serde_json::to_string(&transit_packet).unwrap()
-        transit_packet
-    }
-}
-
-impl fmt::Display for GDPPacket {
-    // This trait requires `fmt` with this exact signature.
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Write strictly the first element into the supplied output
-        // stream: `f`. Returns `fmt::Result` which indicates whether the
-        // operation succeeded or failed. Note that `write!` uses syntax which
-        // is very similar to `println!`.
-        if let Some(payload) = &self.payload {
-            let ret = match std::str::from_utf8(&payload) {
-                Ok(payload) => payload.trim_matches(char::from(0)),
-                Err(_) => "unable to render",
-            };
-            write!(f, "{:?}: {:?}", self.gdpname, ret)
-        } else {
-            write!(f, "{:?}: packet do not exist", self.gdpname)
+        let name_record_len = self.name_record.as_ref()
+            .and_then(|r| serde_json::to_string(r).ok())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        
+        let payload_len = self.payload.as_ref().map(|p| p.len()).unwrap_or(0);
+        
+        GDPHeaderInTransit {
+            action: self.action,
+            destination: self.gdpname,
+            length: payload_len + name_record_len,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct GDPChannel {
-    pub gdpname: GDPName,
-    pub source: GDPName,
-    pub channel: UnboundedSender<GDPPacket>,
-    pub comment: String,
+impl fmt::Display for GDPPacket {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.payload {
+            Some(payload) => {
+                let content = std::str::from_utf8(payload)
+                    .map(|s| s.trim_matches(char::from(0)))
+                    .unwrap_or("<binary>");
+                write!(f, "{}: {:?}", self.gdpname, content)
+            }
+            None => write!(f, "{}: <no payload>", self.gdpname),
+        }
+    }
 }
 
-// union in rust is unsafe, use struct instead
-// name record is what being stored in RIB and used for routing
-// one can resolve the GDPNameRecord using RIB put and get
-// it can be safely ported for another machine to connect
+/// Metadata stored in the RIB for topic resolution.
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct GDPNameRecord {
     pub record_type: GDPNameRecordType,
     pub gdpname: GDPName,
-    // the source of the record
-    // if the record is the query, then the source_gdpname is the destination
-    // that forward the data
     pub source_gdpname: GDPName,
     pub webrtc_offer: Option<String>,
     pub ip_address: Option<String>,
-    pub ros: Option<(String, String)>,
-    // indirect to another GDPName
-    // this occurs if certain gdpname is hosted on a machine;
-    // then we solve the GDP name to the machine's GDPName
-    pub indirect: Option<GDPName>,
+    pub ros: Option<(String, String)>,  // (topic_name, topic_type)
+    pub indirect: Option<GDPName>,       // For forwarding to another node
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum GDPNameRecordType {
     EMPTY,
-    INFO, // inform the existence of the record, does not replace if present
+    INFO,    // Inform existence, don't replace
     QUERY,
-    UPDATE, // update the existing record by replacing the old one
-    MERGE,  // merge-able into the existing record
+    UPDATE,  // Replace existing
+    MERGE,   // Merge with existing
     DELETE,
 }
 
-use sha2::Digest;
-use sha2::Sha256;
-
-// Generate unique 4-byte identifier from topic metadata
-// Same (topic_name, topic_type, cert) → same GDPName across all nodes
-// This enables distributed topic matching without central coordination
-pub fn get_gdp_name_from_topic(topic_name: &str, topic_type: &str, cert: &[u8]) -> [u8; 4] {
-    // create a Sha256 object
-    let mut hasher = Sha256::new();
-
-    info!(
-        "Name is generated from topic_name: {}, topic_type: {}, cert: (too long, not printed)",
-        topic_name, topic_type
-    );
-    // hash with name, type and certificate
-    hasher.update(topic_name);
-    hasher.update(topic_type);
-    hasher.update(cert);
-    let result = hasher.finalize();
-    // Get the first 4 bytes of the digest
-    let mut bytes = [0u8; 4];
-    bytes.copy_from_slice(&result[..4]);
-    bytes
-}
-
-#[derive(Debug, Clone)]
-pub struct GDPStatus {
-    pub sink: UnboundedSender<GDPPacket>,
-}
-
-// Convert GDPName to comma-separated string for Redis keys (e.g., "167,229,32,134")
-pub fn gdp_name_to_string(GDPName(name): GDPName) -> String {
-    format!("{:x}{:x}{:x}{:x}", name[0], name[1], name[2], name[3])
-}
-
+/// An edge in the routing tree: publisher -> subscriber.
 #[derive(Clone)]
 pub struct Connection {
-  pub publisher: GDPName,
-  pub subscriber: GDPName
+    pub publisher: GDPName,
+    pub subscriber: GDPName,
 }
 
 impl ToString for Connection {
     fn to_string(&self) -> String {
-      format!("{}-{}", self.publisher, self.subscriber)
+        format!("{}-{}", self.publisher, self.subscriber)
     }
 }
 
@@ -271,24 +178,14 @@ impl FromStr for Connection {
     type Err = ParseIntError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-      let mut parts = s.split("-");
-
-      let publisher_str = parts.next()
-          .ok_or_else(|| "invalid".parse::<i32>().unwrap_err())?;
-      let subscriber_str = parts.next()
-          .ok_or_else(|| "invalid".parse::<i32>().unwrap_err())?;
-
-      // Check for extra parts
-      if parts.next().is_some() {
-          return Err("invalid".parse::<i32>().unwrap_err());
-      }
-
-      let publisher = GDPName::from_str(publisher_str)?;
-      let subscriber = GDPName::from_str(subscriber_str)?;
-
-      Ok(Connection {
-        publisher,
-        subscriber
-      })
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 2 {
+            return Err("invalid".parse::<i32>().unwrap_err());
+        }
+        
+        Ok(Connection {
+            publisher: GDPName::from_str(parts[0])?,
+            subscriber: GDPName::from_str(parts[1])?,
+        })
     }
 }

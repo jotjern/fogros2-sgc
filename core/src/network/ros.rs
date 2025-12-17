@@ -1,3 +1,9 @@
+//! ROS2 <-> WebRTC bridge.
+//!
+//! Provides two forwarders:
+//! - `ros_to_network_forwarder`: Subscribes to ROS topic, sends to WebRTC
+//! - `network_to_ros_forwarder`: Receives from WebRTC, publishes to ROS topic
+
 use crate::db::get_redis_url;
 use crate::pipeline::construct_gdp_forward_from_bytes;
 use crate::structs::get_gdp_name_from_topic;
@@ -15,7 +21,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task;
 
-// Best-effort Redis debug signal for message flow.
+/// Publishes debug signals to Redis for dashboard visualization.
 #[cfg(feature = "ros")]
 fn fire_debug_signal(node: &GDPName, topic: &str, direction: &str, payload: &[u8]) {
     let topic = topic.to_string();

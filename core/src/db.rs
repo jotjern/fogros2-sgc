@@ -1,3 +1,8 @@
+//! Redis/RIB (Routing Information Base) helpers.
+//!
+//! Provides optimistic CAS updates (WATCH/MULTI/EXEC) for routing state,
+//! keyspace notifications for dynamic discovery, and GDP name mapping.
+
 use futures::StreamExt;
 use log::{error, info};
 use redis::{self, Client, Commands, RedisResult};
@@ -5,8 +10,6 @@ use redis_async::client;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use utils::app_config::AppConfig;
 use crate::structs::GDPName;
-
-// Get Redis URL for RIB (Routing Information Base)
 pub fn get_redis_url() -> String {
     let config = AppConfig::fetch().expect("Failed to fetch config");
     format!("redis://{}", config.routing_information_base_address)

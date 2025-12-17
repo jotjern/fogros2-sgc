@@ -7,7 +7,6 @@ use core::commands;
 use std::path::PathBuf;
 use utils::app_config::AppConfig;
 use utils::error::Result;
-use utils::types::LogLevel;
 
 #[derive(Parser, Debug)]
 #[clap(
@@ -24,28 +23,6 @@ pub struct Cli {
     #[clap(short, long, parse(from_os_str), value_name = "FILE")]
     pub config: Option<PathBuf>,
 
-    /// Set a custom config file
-    #[clap(name = "debug", short, long = "debug", value_name = "DEBUG")]
-    pub debug: Option<bool>,
-
-    /// Set Log Level
-    #[clap(
-        name = "log_level",
-        short,
-        long = "log-level",
-        value_name = "LOG_LEVEL"
-    )]
-    pub log_level: Option<LogLevel>,
-
-    /// Set Net Interface
-    #[clap(
-        name = "net_interface",
-        short,
-        long = "net-interface",
-        value_name = "eno1"
-    )]
-    pub net_interface: Option<String>,
-
     /// Subcommands
     #[clap(subcommand)]
     command: Commands,
@@ -59,12 +36,6 @@ enum Commands {
         long_about = None,
     )]
     Router,
-    #[clap(
-        name = "client",
-        about = "Run test dtls client",
-        long_about = None,
-    )]
-    Error,
     #[clap(
         name = "completion",
         about = "Generate completion scripts",
@@ -93,20 +64,15 @@ enum CompletionSubcommand {
 }
 
 pub fn cli_match() -> Result<()> {
-    // Parse the command line arguments
     let cli = Cli::parse();
 
-    // Merge clap config file if the value is set
     AppConfig::merge_config(cli.config.as_deref())?;
 
     let app = Cli::into_app();
-
     AppConfig::merge_args(app)?;
 
-    // Execute the subcommand
     match &cli.command {
         Commands::Router => commands::router()?,
-        Commands::Error => commands::simulate_error()?,
         Commands::Completion { subcommand } => {
             let mut app = Cli::into_app();
             match subcommand {

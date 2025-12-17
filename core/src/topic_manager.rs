@@ -1,3 +1,11 @@
+//! Topic connection management.
+//!
+//! Orchestrates the lifecycle of WebRTC connections for each ROS topic:
+//! - Watches Redis for routing changes (connection add/remove)
+//! - Establishes WebRTC data channels via signaling server
+//! - Spawns ROS forwarders (ros_to_network / network_to_ros)
+//! - Handles reconnection when edges are removed from the routing tree
+
 use crate::connection_store::{connection_id, is_node_involved, parse_connection};
 use crate::db::{get_redis_url, watch_redis_key, RedisKeyChange};
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
@@ -65,17 +73,17 @@ async fn establish_connection(
 
     // Spawn connection setup in background
     tokio::spawn(async move {
-        info!("[Connection] Starting WebRTC setup for signal_id: {}", my_signal_id);
         let (webrtc_stream, webrtc_shutdown) = match register_webrtc_stream(&my_signal_id, signal_id_to_dial).await {
-            (stream, shutdown) => {
-                info!("[Connection] WebRTC stream established successfully for signal_id: {}", my_signal_id);
-                (stream, shutdown)
+            Ok((stream, shutdown)) => (stream, shutdown),
+            Err(e) => {
+                error!("[Connection] WebRTC setup failed for {}: {}", my_signal_id, e);
+                return;
             }
         };
 
         let (ros_tx, ros_rx) = unbounded_channel();
         let (rtc_tx, rtc_rx) = unbounded_channel();
-        let node_name = format!("ros_manager_node_{}", rand::random::<u32>());
+        let node_name = format!("sgc_node_{}", rand::random::<u32>());
 
         // Forward shutdown signal to WebRTC
         let mut shutdown_rx = shutdown_tx_for_webrtc.subscribe();
@@ -85,24 +93,21 @@ async fn establish_connection(
             let _ = webrtc_shutdown_clone.send(());
         });
 
-        info!("[Connection] Spawning WebRTC reader/writer for signal_id: {}", my_signal_id);
         tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
         
         if is_publisher {
-            info!("[Connection] Spawning ROS to network forwarder for signal_id: {}", my_signal_id);
             tokio::spawn(ros_to_network_forwarder(
                 node_name, topic_name_owned, topic_type_owned,
                 certificate_owned, rtc_tx,
             ));
         } else {
-            info!("[Connection] Spawning network to ROS forwarder for signal_id: {}", my_signal_id);
             tokio::spawn(network_to_ros_forwarder(
                 node_name, topic_name_owned, topic_type_owned,
                 certificate_owned, my_gdp_name, ros_rx,
             ));
         }
         
-        info!("[Connection] All tasks spawned successfully for signal_id: {}", my_signal_id);
+        info!("[Connection] Established: {}", my_signal_id);
     });
 
     shutdown_tx

@@ -5,38 +5,50 @@ Set up SGC for your own robot fleet.
 ## Overview
 
 You need:
-1. **Infrastructure**: Signaling server + Redis (one set, shared by all robots)
-2. **Group secret**: Shared by all robots in your fleet
-3. **Config file**: One per robot, specifying its topics
+1. **Signaling server**: Relays WebRTC handshakes (can be shared/public)
+2. **Redis server**: Stores routing state (must be private per fleet)
+3. **Group secret**: Shared by all robots in your fleet
+4. **Config file**: One per robot, specifying its topics
 
 ## Step 1: Deploy Infrastructure
 
-### Option A: Use Public Servers (Testing Only)
+### Signaling Server
 
-For quick testing, use Berkeley's public servers:
-- Signaling: `ws://3.18.194.127:8000`
-- Routing: `3.18.194.127:8002`
+The signaling server can be shared across fleets - it only relays encrypted handshakes.
 
-**Warning**: These are for testing only. Don't use for production.
-
-### Option B: Self-Hosted (Recommended)
-
-Deploy your own servers using Docker:
-
-```bash
-# On a server with public IP (or accessible from all robots)
-docker compose up -d rib signal
-```
-
-This exposes:
-- Signaling server on port 8005
-- Redis on port 8003
-
-Use these URLs in your config:
+**Option A: Use a public signaling server**
 ```toml
-signaling_server = "ws://YOUR_SERVER_IP:8005"
-routing_server = "YOUR_SERVER_IP:8003"
+signaling_server = "ws://signal.example.com:8000"
 ```
+
+**Option B: Self-hosted**
+```bash
+docker compose up -d signal
+# Exposes port 8005
+```
+
+### Redis (Routing Server)
+
+**Redis must be private to your fleet.** See [Security](security.md) for details.
+
+**Option A: Local Redis (single-site fleet)**
+```bash
+docker run -d --name redis -p 6379:6379 redis:6
+```
+
+**Option B: Redis with AUTH (multi-site fleet)**
+```bash
+docker run -d --name redis -p 6379:6379 redis:6 --requirepass YOUR_SECRET_PASSWORD
+```
+
+Config:
+```toml
+routing_server = "redis://:YOUR_SECRET_PASSWORD@your-redis-host:6379"
+```
+
+**Option C: Private network**
+
+Run Redis on a private network accessible only to your robots (VPN, private subnet, etc.).
 
 ## Step 2: Generate Group Secret
 

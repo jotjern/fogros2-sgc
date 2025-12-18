@@ -3,146 +3,37 @@ import json
 import os
 import time
 from collections import defaultdict
-from datetime import datetime
 from random import Random
 
-import redis
-from python_on_whales import DockerClient
+from bench_utils import (
+    PROJECT_DIR,
+    choose_proxies,
+    connected_listener_count,
+    docker,
+    hop_histogram,
+    log,
+    net_delta,
+    net_snapshot,
+    service_of,
+    teardown,
+)
 
-
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COMPOSE_FILE = os.path.join(PROJECT_DIR, "docker-compose.yaml")
 OUT_DIR = os.path.join(PROJECT_DIR, "bench", "results")
+OUT_JSON = os.path.join(OUT_DIR, "benchmark3_storm.json")
+OUT_HOPS = os.path.join(OUT_DIR, "benchmark3_hops.png")
+OUT_RX = os.path.join(OUT_DIR, "benchmark3_listener_rx.png")
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 8002
-
-
-def ts():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def log(msg):
-    print(msg, flush=True)
-
-
-def docker():
-    return DockerClient(compose_files=[COMPOSE_FILE])
-
-
-def rds():
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
-
-def choose_proxies(num_listeners, fanout):
-    f = int(fanout)
-    if f <= 0:
-        f = 1
-    return max(1, ((num_listeners + f - 1) // f) * 2)
-
-
-def net_snapshot(docker_cli):
-    out = {}
-    ps = docker_cli.compose.ps()
-    if not ps:
-        return out
-    stats = docker_cli.container.stats([c.id for c in ps])
-    for s in stats:
-        name = s.container_name
-        parts = name.split("-")
-        svc = parts[-2] if len(parts) >= 2 else name
-        rx = getattr(s, "net_download", 0) or 0
-        tx = getattr(s, "net_upload", 0) or 0
-        try:
-            rx = int(rx)
-        except Exception:
-            rx = 0
-        try:
-            tx = int(tx)
-        except Exception:
-            tx = 0
-        out[name] = {"service": svc, "rx": rx, "tx": tx}
-    return out
-
-
-def net_delta(a, b):
-    out = {}
-    for name, v in (a or {}).items():
-        w = (b or {}).get(name)
-        if not w:
-            continue
-        rx = int(w.get("rx", 0)) - int(v.get("rx", 0))
-        tx = int(w.get("tx", 0)) - int(v.get("tx", 0))
-        if rx < 0:
-            rx = 0
-        if tx < 0:
-            tx = 0
-        out[name] = {"service": v.get("service"), "rx": rx, "tx": tx}
-    return out
-
-
-def routing_states():
-    try:
-        r = rds()
-        keys = r.keys("*-routing")
-        out = []
-        for k in keys:
-            raw = r.get(k)
-            if not raw:
-                continue
-            try:
-                st = json.loads(raw)
-            except Exception:
-                continue
-            out.append((k, st))
-        r.close()
-        return out
-    except Exception:
-        return []
-
-
-def hop_histogram():
-    hist = defaultdict(int)
-    for _k, st in routing_states():
-        pubs = (st or {}).get("publishers", []) or []
-        if not pubs:
-            continue
-        root = pubs[0]
-        proxies = set((st or {}).get("proxies", []) or [])
-        pubs_set = set(pubs)
-        edges = (st or {}).get("edges", []) or []
-        children = defaultdict(list)
-        for e in edges:
-            p = (e or {}).get("parent")
-            c = (e or {}).get("child")
-            if p and c:
-                children[p].append(c)
-        dist = {root: 0}
-        q = [root]
-        while q:
-            n = q.pop(0)
-            for c in children.get(n, []):
-                if c in dist:
-                    continue
-                dist[c] = dist[n] + 1
-                q.append(c)
-        for node, d in dist.items():
-            if node in proxies or node in pubs_set:
-                continue
-            if d > 0:
-                hist[d] += 1
-    return dict(sorted(hist.items()))
-
-
-def connected_listener_count():
-    connected = set()
-    for _k, st in routing_states():
-        proxies = set((st or {}).get("proxies", []) or [])
-        publishers = set((st or {}).get("publishers", []) or [])
-        for e in (st or {}).get("edges", []) or []:
-            child = (e or {}).get("child")
-            if child and child not in proxies and child not in publishers:
-                connected.add(child)
-    return len(connected)
+# What we want (hardcoded):
+MODE = "hierarchical"  # (storm plots rely on hops; direct mode is less interesting here)
+LISTENERS = 50
+FANOUT = 3
+MEASURE_INTERVAL_SECS = 1.0
+PRE_SECS = 5.0
+DOWN_SECS = 10.0
+POST_SECS = 30.0
+STORM_PERCENT = 50.0
+TIMEOUT_SECS = 240
+SEED = 1
 
 
 def wait_for_listeners(expected, timeout_secs):
@@ -232,54 +123,76 @@ def plot_listener_rx(storm, out_path):
     fig.savefig(out_path, dpi=160)
 
 
+def _extract_or_raise(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    run = payload.get("run")
+    if not isinstance(run, dict):
+        raise ValueError("payload must have a 'run' dict")
+    samples = run.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("run.samples missing/empty")
+    phases = {s.get("phase") for s in samples if isinstance(s, dict)}
+    if "down" not in phases or "post" not in phases:
+        raise ValueError(f"missing storm phases (need down+post), have={sorted(phases)}")
+    for s in samples:
+        if not isinstance(s, dict):
+            continue
+        if "t" not in s or "listener_rx_mbps" not in s or "hops" not in s:
+            raise ValueError(f"bad sample: {s}")
+    return run
+
+
+def _plot(run):
+    plot_hops(run, OUT_HOPS)
+    plot_listener_rx(run, OUT_RX)
+
+
 def main():
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--listeners", type=int, default=50)
-    ap.add_argument("--fanout", type=int, default=3)
-    ap.add_argument("--mode", choices=["hierarchical", "direct"], default="hierarchical")
-    ap.add_argument("--measure-interval-secs", type=float, default=1.0)
-    ap.add_argument("--pre-secs", type=float, default=5.0)
-    ap.add_argument("--down-secs", type=float, default=10.0)
-    ap.add_argument("--post-secs", type=float, default=30.0)
-    ap.add_argument("--storm-percent", type=float, default=50.0)
-    ap.add_argument("--timeout-secs", type=int, default=240)
-    ap.add_argument("--seed", type=int, default=1)
-    args = ap.parse_args()
-
-    tstamp = ts()
-    out_json = os.path.join(OUT_DIR, f"benchmark3_storm_{args.mode}_fanout{args.fanout}_{tstamp}.json")
-    out_hops = os.path.join(OUT_DIR, f"benchmark3_hops_{args.mode}_fanout{args.fanout}_{tstamp}.png")
-    out_rx = os.path.join(OUT_DIR, f"benchmark3_listener_rx_{args.mode}_fanout{args.fanout}_{tstamp}.png")
-
     docker_cli = docker()
 
-    proxy_count = 0 if args.mode == "direct" else choose_proxies(args.listeners, args.fanout)
+    if os.path.exists(OUT_JSON):
+        try:
+            with open(OUT_JSON, "r") as f:
+                cached = json.load(f)
+            run = _extract_or_raise(cached)
+            log(f"  using cached data: {OUT_JSON}")
+            _plot(run)
+            log(f"wrote: {OUT_HOPS}")
+            log(f"wrote: {OUT_RX}")
+            return
+        except Exception as e:
+            log(f"  cached data invalid, re-running benchmark: {e}")
+
+    proxy_count = 0 if MODE == "direct" else choose_proxies(LISTENERS, FANOUT)
     log("=== benchmark3: storm ===")
-    log(f"  mode={args.mode} fanout={args.fanout} listeners={args.listeners} proxies={proxy_count}")
-    log(f"  storm_percent={args.storm_percent} pre={args.pre_secs}s down={args.down_secs}s post={args.post_secs}s sample_interval={args.measure_interval_secs}s")
-    os.environ["FANOUT_FACTOR"] = str(args.fanout)
+    log(f"  mode={MODE} fanout={FANOUT} listeners={LISTENERS} proxies={proxy_count}")
+    log(f"  storm_percent={STORM_PERCENT} pre={PRE_SECS}s down={DOWN_SECS}s post={POST_SECS}s sample_interval={MEASURE_INTERVAL_SECS}s")
+    os.environ["FANOUT_FACTOR"] = str(FANOUT)
     os.environ["BENCH_LATENCY"] = "1"
     os.environ["BENCH_LATENCY_HZ"] = "10"
 
     log("  bringing up docker compose...")
-    docker_cli.compose.down(volumes=True, remove_orphans=True)
-    time.sleep(2)
-    docker_cli.compose.up(detach=True, scales={"listener": args.listeners, "proxy": proxy_count})
+    teardown(docker_cli, volumes=True)
+    docker_cli.compose.up(detach=True, scales={"listener": LISTENERS, "proxy": proxy_count})
 
     log("  waiting for all listeners to connect...")
-    ok = wait_for_listeners(args.listeners, args.timeout_secs)
+    ok = wait_for_listeners(LISTENERS, TIMEOUT_SECS)
     if not ok:
-        docker_cli.compose.down(volumes=True, remove_orphans=True)
+        teardown(docker_cli, volumes=True)
         raise SystemExit("listeners did not connect in time")
     log("  all listeners connected")
 
-    rng = Random(int(args.seed))
-    listener_containers = [(c.id, getattr(c, "container_name", "") or c.id) for c in docker_cli.compose.ps() if "listener" in (getattr(c, "container_name", "") or "")]
+    rng = Random(int(SEED))
+    cache = {}
+    listener_containers = [
+        (c.id, getattr(c, "container_name", "") or c.id)
+        for c in docker_cli.compose.ps()
+        if service_of(docker_cli, c, cache) == "listener"
+    ]
     rng.shuffle(listener_containers)
-    k = int(round((max(0.0, min(100.0, float(args.storm_percent))) / 100.0) * len(listener_containers)))
-    if len(listener_containers) > 0 and float(args.storm_percent) > 0:
+    k = int(round((max(0.0, min(100.0, float(STORM_PERCENT))) / 100.0) * len(listener_containers)))
+    if len(listener_containers) > 0 and float(STORM_PERCENT) > 0:
         k = max(1, k)
     k = min(k, len(listener_containers))
     down = listener_containers[:k]
@@ -295,7 +208,7 @@ def main():
         cur = net_snapshot(docker_cli)
         d = net_delta(last_net, cur)
         last_net = cur
-        dt = max(0.001, float(args.measure_interval_secs))
+        dt = max(0.001, float(MEASURE_INTERVAL_SECS))
         talker_tx = sum(int(v.get("tx", 0)) for v in d.values() if (v or {}).get("service") == "talker")
         listener_rx = sum(int(v.get("rx", 0)) for v in d.values() if (v or {}).get("service") == "listener")
         samples.append(
@@ -309,11 +222,11 @@ def main():
             }
         )
 
-    end_pre = time.time() + float(args.pre_secs)
+    end_pre = time.time() + float(PRE_SECS)
     log("  phase=pre sampling...")
     while time.time() < end_pre:
         sample("pre")
-        time.sleep(float(args.measure_interval_secs))
+        time.sleep(float(MEASURE_INTERVAL_SECS))
 
     log("  phase=down stopping listeners...")
     for cid, _ in down:
@@ -322,11 +235,11 @@ def main():
         except Exception:
             pass
 
-    end_down = time.time() + float(args.down_secs)
+    end_down = time.time() + float(DOWN_SECS)
     log("  phase=down sampling...")
     while time.time() < end_down:
         sample("down")
-        time.sleep(float(args.measure_interval_secs))
+        time.sleep(float(MEASURE_INTERVAL_SECS))
 
     log("  phase=post starting listeners...")
     for cid, _ in down:
@@ -335,37 +248,48 @@ def main():
         except Exception:
             pass
 
-    end_post = time.time() + float(args.post_secs)
+    end_post = time.time() + float(POST_SECS)
     log("  phase=post sampling...")
     while time.time() < end_post:
         sample("post")
-        time.sleep(float(args.measure_interval_secs))
+        time.sleep(float(MEASURE_INTERVAL_SECS))
 
     log("  tearing down docker compose...")
-    docker_cli.compose.down(volumes=True, remove_orphans=True)
+    teardown(docker_cli, volumes=True)
 
     payload = {
-        "meta": vars(args),
+        "meta": {
+            "mode": MODE,
+            "fanout": FANOUT,
+            "listeners": LISTENERS,
+            "measure_interval_secs": MEASURE_INTERVAL_SECS,
+            "pre_secs": PRE_SECS,
+            "down_secs": DOWN_SECS,
+            "post_secs": POST_SECS,
+            "storm_percent": STORM_PERCENT,
+            "timeout_secs": TIMEOUT_SECS,
+            "seed": SEED,
+        },
         "run": {
-            "mode": args.mode,
-            "fanout": args.fanout,
-            "listeners": args.listeners,
+            "mode": MODE,
+            "fanout": FANOUT,
+            "listeners": LISTENERS,
             "proxies": proxy_count,
-            "storm_percent": float(args.storm_percent),
+            "storm_percent": float(STORM_PERCENT),
             "down_count": len(down),
             "samples": samples,
         },
     }
     os.makedirs(OUT_DIR, exist_ok=True)
-    with open(out_json, "w") as f:
+    with open(OUT_JSON, "w") as f:
         json.dump(payload, f, indent=2)
 
-    plot_hops(payload["run"], out_hops)
-    plot_listener_rx(payload["run"], out_rx)
+    run = _extract_or_raise(payload)
+    _plot(run)
 
-    log(f"wrote: {out_json}")
-    log(f"wrote: {out_hops}")
-    log(f"wrote: {out_rx}")
+    log(f"wrote: {OUT_JSON}")
+    log(f"wrote: {OUT_HOPS}")
+    log(f"wrote: {OUT_RX}")
 
 
 if __name__ == "__main__":

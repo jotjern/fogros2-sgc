@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import subprocess
 import sys
@@ -9,19 +8,12 @@ from datetime import datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RESULTS_DIR = os.path.join(ROOT, "bench", "results")
 
-SYSTEM_BENCH = os.path.join(ROOT, "bench", "system_benchmark.py")
-SYS_RESULTS = os.path.join(ROOT, "bench", "results", "system_results.json")
-SYS_RESULTS_CHURN10 = os.path.join(ROOT, "bench", "results", "system_results_churn10.json")
-
-
-def ts():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-PLOTS = [
-    os.path.join(ROOT, "bench", "plot_throughput_per_listener.py"),
-    os.path.join(ROOT, "bench", "plot_latency_per_listener.py"),
-    os.path.join(ROOT, "bench", "plot_cpu_churn10.py"),
+SCRIPTS = [
+    os.path.join(ROOT, "bench", "benchmark1_compare.py"),
+    os.path.join(ROOT, "bench", "benchmark2_join_latency.py"),
+    os.path.join(ROOT, "bench", "benchmark3_storm.py"),
+    os.path.join(ROOT, "bench", "benchmark4_jitter.py"),
+    os.path.join(ROOT, "bench", "benchmark5_proxy_cpu_churn.py"),
 ]
 
 
@@ -63,16 +55,8 @@ def run_one(cmd, logf, label):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fanouts", default="3,1000")
-    ap.add_argument("--listeners", default="25")
-    ap.add_argument("--proxy-mode", default="auto")
-    ap.add_argument("--measure-secs", type=int, default=1)
-    ap.add_argument("--timeout-secs", type=int, default=240)
-    args = ap.parse_args()
-
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    log_path = os.path.join(RESULTS_DIR, f"plot_run_{ts()}.log")
+    log_path = os.path.join(RESULTS_DIR, "run_all.log")
     ok = 0
     fail = 0
 
@@ -80,59 +64,11 @@ def main():
         logf.write(f"run at {datetime.now().isoformat()}\n")
         print(f"[LOG] {log_path}", flush=True)
 
-        # Always generate the JSON inputs first (skip-but-log on failure).
-        bench_cmd = [
-            sys.executable,
-            "-u",
-            SYSTEM_BENCH,
-            "--fanouts",
-            args.fanouts,
-            "--listeners",
-            args.listeners,
-            "--proxy-mode",
-            args.proxy_mode,
-            "--measure-secs",
-            str(args.measure_secs),
-            "--timeout-secs",
-            str(args.timeout_secs),
-            "--out",
-            SYS_RESULTS,
-        ]
-        if run_one(bench_cmd, logf, "system_benchmark (normal)"):
-            ok += 1
-        else:
-            fail += 1
-
-        churn_cmd = [
-            sys.executable,
-            "-u",
-            SYSTEM_BENCH,
-            "--fanouts",
-            args.fanouts,
-            "--listeners",
-            args.listeners,
-            "--proxy-mode",
-            args.proxy_mode,
-            "--measure-secs",
-            str(args.measure_secs),
-            "--timeout-secs",
-            str(args.timeout_secs),
-            "--chaos-restart",
-            "--chaos-percent",
-            "10",
-            "--out",
-            SYS_RESULTS_CHURN10,
-        ]
-        if run_one(churn_cmd, logf, "system_benchmark (10% churn)"):
-            ok += 1
-        else:
-            fail += 1
-
-        for path in PLOTS:
+        for path in SCRIPTS:
             if not os.path.exists(path):
-                logf.write(f"[SKIP] missing plot script: {path}\n")
+                logf.write(f"[SKIP] missing script: {path}\n")
                 fail += 1
-                print(f"[SKIP] missing plot script: {os.path.basename(path)}", flush=True)
+                print(f"[SKIP] missing script: {os.path.basename(path)}", flush=True)
                 continue
             if run_one([sys.executable, "-u", path], logf, os.path.basename(path)):
                 ok += 1

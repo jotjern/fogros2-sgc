@@ -1,152 +1,32 @@
 #!/usr/bin/env python3
 import json
 import os
-import re
-import time
-from datetime import datetime
-from random import Random
 
-import redis
-from python_on_whales import DockerClient
+from bench_utils import (
+    PROJECT_DIR,
+    choose_proxies,
+    compose_up,
+    docker,
+    log,
+    measure_net,
+    parse_latency_samples_from_logs,
+    teardown,
+    wait_for_listeners,
+)
 
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COMPOSE_FILE = os.path.join(PROJECT_DIR, "docker-compose.yaml")
 OUT_DIR = os.path.join(PROJECT_DIR, "bench", "results")
+OUT_JSON = os.path.join(OUT_DIR, "benchmark1_compare.json")
+OUT_THR = os.path.join(OUT_DIR, "benchmark1_throughput.png")
+OUT_LAT = os.path.join(OUT_DIR, "benchmark1_latency.png")
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 8002
-
-LAT_RE = re.compile(r"BENCH_LATENCY_MS=([0-9]*\.?[0-9]+)")
-
-def log(msg):
-    print(msg, flush=True)
-
-
-def ts():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def docker():
-    return DockerClient(compose_files=[COMPOSE_FILE])
-
-
-def rds():
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
-
-def service_of(docker_cli, c, cache):
-    s = getattr(c, "service", None) or getattr(c, "service_name", None)
-    if s:
-        return str(s)
-    cid = getattr(c, "id", None)
-    if cid:
-        if cid in cache:
-            return cache[cid]
-        try:
-            info = docker_cli.container.inspect(cid)
-            labels = getattr(getattr(info, "config", None), "labels", None) or {}
-            svc = labels.get("com.docker.compose.service")
-            if svc:
-                cache[cid] = svc
-                return svc
-        except Exception:
-            pass
-    name = getattr(c, "container_name", "") or getattr(c, "name", "") or cid or ""
-    parts = name.split("-")
-    return parts[-2] if len(parts) >= 2 else name
-
-
-def choose_proxies(num_listeners, fanout):
-    f = int(fanout)
-    if f <= 0:
-        f = 1
-    return max(1, ((num_listeners + f - 1) // f) * 2)
-
-
-def wait_for_listeners(expected, timeout_secs):
-    start = time.time()
-    while time.time() - start < timeout_secs:
-        try:
-            r = rds()
-            connected = set()
-            for key in r.keys("*-routing"):
-                raw = r.get(key)
-                if not raw:
-                    continue
-                try:
-                    st = json.loads(raw)
-                except Exception:
-                    continue
-                proxies = set((st.get("proxies", []) or []))
-                publishers = set((st.get("publishers", []) or []))
-                for e in (st.get("edges", []) or []):
-                    child = (e or {}).get("child")
-                    if child and child not in proxies and child not in publishers:
-                        connected.add(child)
-            r.close()
-            print(f"  {len(connected)}/{expected} listeners connected ({int(time.time()-start)}s)", flush=True)
-            if len(connected) >= expected:
-                return True
-        except Exception:
-            pass
-        time.sleep(3)
-    return False
-
-
-def net_snapshot(docker_cli):
-    out = {}
-    ps = docker_cli.compose.ps()
-    if not ps:
-        return out
-    stats = docker_cli.container.stats([c.id for c in ps])
-    for s in stats:
-        name = s.container_name
-        parts = name.split("-")
-        svc = parts[-2] if len(parts) >= 2 else name
-        rx = getattr(s, "net_download", 0) or 0
-        tx = getattr(s, "net_upload", 0) or 0
-        try:
-            rx = int(rx)
-        except Exception:
-            rx = 0
-        try:
-            tx = int(tx)
-        except Exception:
-            tx = 0
-        out[name] = {"service": svc, "rx": rx, "tx": tx}
-    return out
-
-
-def net_delta(a, b):
-    out = {}
-    for name, v in (a or {}).items():
-        w = (b or {}).get(name)
-        if not w:
-            continue
-        rx = int(w.get("rx", 0)) - int(v.get("rx", 0))
-        tx = int(w.get("tx", 0)) - int(v.get("tx", 0))
-        if rx < 0:
-            rx = 0
-        if tx < 0:
-            tx = 0
-        out[name] = {"service": v.get("service"), "rx": rx, "tx": tx}
-    return out
-
-
-def parse_listener_latencies(docker_cli):
-    cache = {}
-    out = {}
-    for c in docker_cli.compose.ps():
-        if service_of(docker_cli, c, cache) != "listener":
-            continue
-        cname = getattr(c, "container_name", "") or c.id
-        try:
-            txt = docker_cli.container.logs(c.id)
-        except Exception:
-            txt = ""
-        out[cname] = [float(m.group(1)) for m in LAT_RE.finditer(txt or "")]
-    return out
+# What we want (hardcoded):
+LISTENER_SET = [1, 5, 10, 15, 25]
+FANOUT_HIER = 3
+FANOUT_DIRECT = 1000
+MEASURE_SECS = 30
+TIMEOUT_SECS = 240
+LATENCY_HZ = 20.0
 
 
 def run_case(docker_cli, *, mode, fanout, listeners, measure_secs, timeout_secs, latency_hz):
@@ -162,40 +42,28 @@ def run_case(docker_cli, *, mode, fanout, listeners, measure_secs, timeout_secs,
     os.environ["BENCH_LATENCY_HZ"] = str(latency_hz)
 
     log("  bringing up docker compose...")
-    docker_cli.compose.down(volumes=True, remove_orphans=True)
-    time.sleep(2)
-    docker_cli.compose.up(detach=True, scales={"listener": listeners, "proxy": proxy_count})
+    teardown(docker_cli, volumes=True)
+    compose_up(docker_cli, listeners=listeners, proxies=proxy_count, env=None)
 
     log("  waiting for all listeners to connect...")
     ok = wait_for_listeners(listeners, timeout_secs)
     if not ok:
         log("  ERROR: listeners did not connect in time")
-        docker_cli.compose.down(volumes=True, remove_orphans=True)
+        teardown(docker_cli, volumes=True)
         return {"success": False, "error": "listeners did not connect in time"}
     log("  all listeners connected")
 
     log(f"  measuring throughput for {measure_secs}s...")
-    a = net_snapshot(docker_cli)
-    time.sleep(measure_secs)
-    b = net_snapshot(docker_cli)
-    d = net_delta(a, b)
-
-    talker_tx = sum(int(v.get("tx", 0)) for v in d.values() if (v or {}).get("service") == "talker")
-    listener_rx = sum(int(v.get("rx", 0)) for v in d.values() if (v or {}).get("service") == "listener")
-
-    secs = float(measure_secs)
-    talker_tx_mbps = (talker_tx * 8.0) / (secs * 1e6) if secs > 0 else 0.0
-    listener_rx_mbps = (listener_rx * 8.0) / (secs * 1e6) if secs > 0 else 0.0
+    _d, talker_tx_mbps, listener_rx_mbps = measure_net(docker_cli, measure_secs)
 
     log("  parsing listener latency samples from logs...")
-    lat = parse_listener_latencies(docker_cli)
+    lat = parse_latency_samples_from_logs(docker_cli, only_service="listener")
     per_listener_mean = {k: (sum(v) / len(v) if v else 0.0) for k, v in lat.items()}
     means = list(per_listener_mean.values())
     avg_latency_ms = (sum(means) / len(means)) if means else 0.0
 
     log("  tearing down docker compose...")
-    docker_cli.compose.down(volumes=True, remove_orphans=True)
-    time.sleep(2)
+    teardown(docker_cli, volumes=True)
 
     return {
         "success": True,
@@ -234,84 +102,41 @@ def plot_bar(xs, a_vals, b_vals, a_label, b_label, title, ylabel, out_path):
     fig.savefig(out_path, dpi=160)
 
 
-def main():
-    import argparse
+def _extract_or_raise(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("payload must have a 'runs' list")
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--listeners", default="1,5,10,15,20,25")
-    ap.add_argument("--max-listeners", type=int, default=None)
-    ap.add_argument("--step", type=int, default=None)
-    ap.add_argument("--measure-secs", type=int, default=30)
-    ap.add_argument("--timeout-secs", type=int, default=240)
-    ap.add_argument("--fanout-hier", type=int, default=3)
-    ap.add_argument("--fanout-direct", type=int, default=1000)
-    ap.add_argument("--latency-hz", type=float, default=20.0)
-    args = ap.parse_args()
-
-    if args.max_listeners is not None:
-        step = int(args.step or 1)
-        xs = list(range(1, int(args.max_listeners) + 1, step))
-    else:
-        xs = [int(x.strip()) for x in str(args.listeners).split(",") if x.strip()]
-
-    log("=== benchmark1: hierarchical vs direct sweep ===")
-    log(f"  listeners={xs}")
-    log(f"  measure_secs={args.measure_secs} timeout_secs={args.timeout_secs} latency_hz={args.latency_hz}")
-    log(f"  hierarchical fanout={args.fanout_hier} | direct fanout={args.fanout_direct} (proxies=0)")
-    tstamp = ts()
-    out_json = os.path.join(OUT_DIR, f"benchmark1_compare_{tstamp}.json")
-    out_thr = os.path.join(OUT_DIR, f"benchmark1_throughput_{tstamp}.png")
-    out_lat = os.path.join(OUT_DIR, f"benchmark1_latency_{tstamp}.png")
-
-    docker_cli = docker()
-    results = {"meta": vars(args), "runs": []}
-
-    for n in xs:
-        # hierarchical
-        results["runs"].append(
-            run_case(
-                docker_cli,
-                mode="hierarchical",
-                fanout=args.fanout_hier,
-                listeners=n,
-                measure_secs=args.measure_secs,
-                timeout_secs=args.timeout_secs,
-                latency_hz=args.latency_hz,
-            )
-        )
-        with open(out_json, "w") as f:
-            json.dump(results, f, indent=2)
-
-        # direct
-        results["runs"].append(
-            run_case(
-                docker_cli,
-                mode="direct",
-                fanout=args.fanout_direct,
-                listeners=n,
-                measure_secs=args.measure_secs,
-                timeout_secs=args.timeout_secs,
-                latency_hz=args.latency_hz,
-            )
-        )
-        with open(out_json, "w") as f:
-            json.dump(results, f, indent=2)
-
-    # build series
-    hier = {}
-    direct = {}
-    for r in results["runs"]:
-        if not r.get("success"):
+    need = {(n, "hierarchical") for n in LISTENER_SET} | {(n, "direct") for n in LISTENER_SET}
+    out = {}
+    for r in runs:
+        if not isinstance(r, dict):
             continue
-        if r["mode"] == "hierarchical":
-            hier[r["listeners"]] = r
-        if r["mode"] == "direct":
-            direct[r["listeners"]] = r
+        if r.get("success") is not True:
+            raise ValueError(f"found failed run: {r}")
+        key = (r.get("listeners"), r.get("mode"))
+        if key not in need:
+            continue
+        thr = ((r.get("throughput") or {}).get("talker_tx_mbps"))
+        lat = ((r.get("latency") or {}).get("avg_per_listener_mean_ms"))
+        if thr is None or lat is None:
+            raise ValueError(f"run missing throughput/latency: {r}")
+        out[key] = {"thr": float(thr), "lat": float(lat)}
 
-    thr_h = [hier.get(x, {}).get("throughput", {}).get("talker_tx_mbps", 0.0) for x in xs]
-    thr_d = [direct.get(x, {}).get("throughput", {}).get("talker_tx_mbps", 0.0) for x in xs]
-    lat_h = [hier.get(x, {}).get("latency", {}).get("avg_per_listener_mean_ms", 0.0) for x in xs]
-    lat_d = [direct.get(x, {}).get("latency", {}).get("avg_per_listener_mean_ms", 0.0) for x in xs]
+    missing = [k for k in sorted(need) if k not in out]
+    if missing:
+        raise ValueError(f"missing runs: {missing}")
+    return out
+
+
+def _plot(extracted):
+    xs = list(LISTENER_SET)
+    thr_d = [extracted[(n, "direct")]["thr"] for n in xs]
+    thr_h = [extracted[(n, "hierarchical")]["thr"] for n in xs]
+    lat_d = [extracted[(n, "direct")]["lat"] for n in xs]
+    lat_h = [extracted[(n, "hierarchical")]["lat"] for n in xs]
 
     plot_bar(
         xs,
@@ -321,7 +146,7 @@ def main():
         "hierarchical (fanout=3)",
         "Throughput vs listeners",
         "Publisher TX (Mbps)",
-        out_thr,
+        OUT_THR,
     )
     plot_bar(
         xs,
@@ -331,12 +156,67 @@ def main():
         "hierarchical (fanout=3)",
         "Latency vs listeners",
         "Avg latency per listener (ms)",
-        out_lat,
+        OUT_LAT,
     )
 
-    log(f"wrote: {out_json}")
-    log(f"wrote: {out_thr}")
-    log(f"wrote: {out_lat}")
+
+def main():
+    xs = list(LISTENER_SET)
+    log("=== benchmark1: hierarchical vs direct sweep ===")
+    log(f"  listeners={xs}")
+    log(f"  measure_secs={MEASURE_SECS} timeout_secs={TIMEOUT_SECS} latency_hz={LATENCY_HZ}")
+    log(f"  hierarchical fanout={FANOUT_HIER} | direct fanout={FANOUT_DIRECT} (proxies=0)")
+
+    if os.path.exists(OUT_JSON):
+        try:
+            with open(OUT_JSON, "r") as f:
+                cached = json.load(f)
+            extracted = _extract_or_raise(cached)
+            log(f"  using cached data: {OUT_JSON}")
+            _plot(extracted)
+            log(f"wrote: {OUT_THR}")
+            log(f"wrote: {OUT_LAT}")
+            return
+        except Exception as e:
+            log(f"  cached data invalid, re-running benchmark: {e}")
+
+    docker_cli = docker()
+    results = {"runs": []}
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    for n in xs:
+        results["runs"].append(
+            run_case(
+                docker_cli,
+                mode="hierarchical",
+                fanout=FANOUT_HIER,
+                listeners=n,
+                measure_secs=MEASURE_SECS,
+                timeout_secs=TIMEOUT_SECS,
+                latency_hz=LATENCY_HZ,
+            )
+        )
+        results["runs"].append(
+            run_case(
+                docker_cli,
+                mode="direct",
+                fanout=FANOUT_DIRECT,
+                listeners=n,
+                measure_secs=MEASURE_SECS,
+                timeout_secs=TIMEOUT_SECS,
+                latency_hz=LATENCY_HZ,
+            )
+        )
+
+    with open(OUT_JSON, "w") as f:
+        json.dump(results, f, indent=2)
+
+    extracted = _extract_or_raise(results)
+    _plot(extracted)
+
+    log(f"wrote: {OUT_JSON}")
+    log(f"wrote: {OUT_THR}")
+    log(f"wrote: {OUT_LAT}")
 
 
 if __name__ == "__main__":

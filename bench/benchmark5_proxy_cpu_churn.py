@@ -2,72 +2,23 @@
 import json
 import os
 import time
-from collections import defaultdict
-from datetime import datetime
 from random import Random
 
-import redis
-from python_on_whales import DockerClient
+from bench_utils import PROJECT_DIR, choose_proxies, docker, log, service_of, teardown, wait_for_listeners
 
-
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COMPOSE_FILE = os.path.join(PROJECT_DIR, "docker-compose.yaml")
 OUT_DIR = os.path.join(PROJECT_DIR, "bench", "results")
+OUT_JSON = os.path.join(OUT_DIR, "benchmark5_proxy_cpu_churn.json")
+OUT_PNG = os.path.join(OUT_DIR, "benchmark5_proxy_cpu_churn.png")
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 8002
-
-
-def ts():
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-def log(msg):
-    print(msg, flush=True)
-
-
-def docker():
-    return DockerClient(compose_files=[COMPOSE_FILE])
-
-
-def rds():
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
-
-def choose_proxies(num_listeners, fanout):
-    f = int(fanout)
-    if f <= 0:
-        f = 1
-    return max(1, ((num_listeners + f - 1) // f) * 2)
-
-
-def wait_for_listeners(expected, timeout_secs):
-    start = time.time()
-    while time.time() - start < timeout_secs:
-        try:
-            r = rds()
-            connected = set()
-            for key in r.keys("*-routing"):
-                raw = r.get(key)
-                if not raw:
-                    continue
-                try:
-                    st = json.loads(raw)
-                except Exception:
-                    continue
-                proxies = set((st.get("proxies", []) or []))
-                publishers = set((st.get("publishers", []) or []))
-                for e in (st.get("edges", []) or []):
-                    child = (e or {}).get("child")
-                    if child and child not in proxies and child not in publishers:
-                        connected.add(child)
-            r.close()
-            print(f"  {len(connected)}/{expected} listeners connected ({int(time.time()-start)}s)", flush=True)
-            if len(connected) >= expected:
-                return True
-        except Exception:
-            pass
-        time.sleep(3)
-    return False
+# What we want (hardcoded):
+LISTENERS = 25
+FANOUT = 3
+MEASURE_SECS = 60.0
+SAMPLE_INTERVAL_SECS = 1.0
+RECONNECT_PERCENT = 10.0
+RECONNECT_INTERVAL_SECS = 5.0
+TIMEOUT_SECS = 240
+SEED = 1
 
 
 def _cpu_percent_from_stats(s):
@@ -93,11 +44,6 @@ def proxy_cpu_snapshot(docker_cli, proxy_ids):
     for s in stats:
         out[s.container_name] = _cpu_percent_from_stats(s)
     return out
-
-
-def service_from_container_name(name):
-    parts = (name or "").split("-")
-    return parts[-2] if len(parts) >= 2 else name
 
 
 def pick_churn_set(all_listener_ids, churn_percent, rng):
@@ -143,85 +89,79 @@ def plot(samples, out_png):
     fig.savefig(out_png, dpi=160)
 
 
+def _extract_or_raise(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a dict")
+    run = payload.get("run")
+    if not isinstance(run, dict):
+        raise ValueError("payload must have a 'run' dict")
+    samples = run.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError("run.samples missing/empty")
+    if not any((s.get("proxy_cpu") or {}) for s in samples if isinstance(s, dict)):
+        raise ValueError("samples have no proxy_cpu data")
+    return samples
+
+
 def main():
-    import argparse
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--listeners", type=int, default=25)
-    ap.add_argument("--fanout", type=int, default=3)
-    ap.add_argument("--measure-secs", type=float, default=60.0)
-    ap.add_argument("--sample-interval-secs", type=float, default=1.0)
-    ap.add_argument("--reconnect-percent", type=float, default=10.0)
-    ap.add_argument("--reconnect-interval-secs", type=float, default=5.0)
-    ap.add_argument("--timeout-secs", type=int, default=240)
-    ap.add_argument("--seed", type=int, default=1)
-    args = ap.parse_args()
-
-    tstamp = ts()
-    out_json = os.path.join(OUT_DIR, f"benchmark5_proxy_cpu_churn_{tstamp}.json")
-    out_png = os.path.join(OUT_DIR, f"benchmark5_proxy_cpu_churn_{tstamp}.png")
-
     docker_cli = docker()
-    proxy_count = choose_proxies(args.listeners, args.fanout)
+    proxy_count = choose_proxies(LISTENERS, FANOUT)
 
     log("=== benchmark5: proxy cpu under reconnect churn ===")
-    log(f"  listeners={args.listeners} fanout={args.fanout} proxies={proxy_count}")
-    log(f"  reconnect_percent={args.reconnect_percent}% every {args.reconnect_interval_secs}s")
-    log(f"  duration={args.measure_secs}s sample_interval={args.sample_interval_secs}s")
+    log(f"  listeners={LISTENERS} fanout={FANOUT} proxies={proxy_count}")
+    log(f"  reconnect_percent={RECONNECT_PERCENT}% every {RECONNECT_INTERVAL_SECS}s")
+    log(f"  duration={MEASURE_SECS}s sample_interval={SAMPLE_INTERVAL_SECS}s")
 
-    os.environ["FANOUT_FACTOR"] = str(args.fanout)
+    if os.path.exists(OUT_JSON):
+        try:
+            with open(OUT_JSON, "r") as f:
+                cached = json.load(f)
+            samples = _extract_or_raise(cached)
+            log(f"  using cached data: {OUT_JSON}")
+            plot(samples, OUT_PNG)
+            log(f"wrote: {OUT_PNG}")
+            return
+        except Exception as e:
+            log(f"  cached data invalid, re-running benchmark: {e}")
+
+    os.environ["FANOUT_FACTOR"] = str(FANOUT)
     os.environ["BENCH_LATENCY"] = "1"
     os.environ["BENCH_LATENCY_HZ"] = "10"
 
     log("  bringing up docker compose...")
-    docker_cli.compose.down(volumes=True, remove_orphans=True)
-    time.sleep(2)
-    docker_cli.compose.up(detach=True, scales={"listener": args.listeners, "proxy": proxy_count})
+    teardown(docker_cli, volumes=True)
+    docker_cli.compose.up(detach=True, scales={"listener": LISTENERS, "proxy": proxy_count})
 
     log("  waiting for all listeners to connect...")
-    ok = wait_for_listeners(args.listeners, args.timeout_secs)
+    ok = wait_for_listeners(LISTENERS, TIMEOUT_SECS)
     if not ok:
-        docker_cli.compose.down(volumes=True, remove_orphans=True)
+        teardown(docker_cli, volumes=True)
         raise SystemExit("listeners did not connect in time")
     log("  all listeners connected")
 
-    # identify proxies + listeners by inspecting compose ps + labels
+    cache = {}
     ps = docker_cli.compose.ps()
-    proxy_ids = []
-    listener_ids = []
-    for c in ps:
-        cid = c.id
-        svc = getattr(c, "service", None) or getattr(c, "service_name", None)
-        if not svc:
-            try:
-                info = docker_cli.container.inspect(cid)
-                labels = getattr(getattr(info, "config", None), "labels", None) or {}
-                svc = labels.get("com.docker.compose.service")
-            except Exception:
-                svc = None
-        if svc == "proxy":
-            proxy_ids.append(cid)
-        if svc == "listener":
-            listener_ids.append(cid)
+    proxy_ids = [c.id for c in ps if service_of(docker_cli, c, cache) == "proxy"]
+    listener_ids = [c.id for c in ps if service_of(docker_cli, c, cache) == "listener"]
 
-    rng = Random(int(args.seed))
+    rng = Random(int(SEED))
     samples = []
     t0 = time.time()
-    next_reconnect = t0 + float(args.reconnect_interval_secs)
+    next_reconnect = t0 + float(RECONNECT_INTERVAL_SECS)
 
-    end = t0 + float(args.measure_secs)
+    end = t0 + float(MEASURE_SECS)
     last_status = 0
     while time.time() < end:
         now = time.time()
         if now >= next_reconnect:
-            churn = pick_churn_set(listener_ids, args.reconnect_percent, rng)
+            churn = pick_churn_set(listener_ids, RECONNECT_PERCENT, rng)
             log(f"  churn: restarting {len(churn)} listeners...")
             for cid in churn:
                 try:
                     docker_cli.container.restart(cid)
                 except Exception:
                     pass
-            next_reconnect = now + float(args.reconnect_interval_secs)
+            next_reconnect = now + float(RECONNECT_INTERVAL_SECS)
 
         cpu = proxy_cpu_snapshot(docker_cli, proxy_ids)
         samples.append({"t": now - t0, "proxy_cpu": cpu})
@@ -230,27 +170,37 @@ def main():
             vals = list(cpu.values())
             avg = (sum(vals) / len(vals)) if vals else 0.0
             log(f"  t={int(now-t0)}s avg_proxy_cpu={avg:.2f}%")
-        time.sleep(float(args.sample_interval_secs))
+        time.sleep(float(SAMPLE_INTERVAL_SECS))
 
     log("  tearing down docker compose...")
-    docker_cli.compose.down(volumes=True, remove_orphans=True)
+    teardown(docker_cli, volumes=True)
 
     payload = {
-        "meta": vars(args),
+        "meta": {
+            "listeners": LISTENERS,
+            "fanout": FANOUT,
+            "measure_secs": MEASURE_SECS,
+            "sample_interval_secs": SAMPLE_INTERVAL_SECS,
+            "reconnect_percent": RECONNECT_PERCENT,
+            "reconnect_interval_secs": RECONNECT_INTERVAL_SECS,
+            "timeout_secs": TIMEOUT_SECS,
+            "seed": SEED,
+        },
         "run": {
-            "listeners": args.listeners,
-            "fanout": args.fanout,
+            "listeners": LISTENERS,
+            "fanout": FANOUT,
             "proxies": proxy_count,
             "samples": samples,
         },
     }
     os.makedirs(OUT_DIR, exist_ok=True)
-    with open(out_json, "w") as f:
+    with open(OUT_JSON, "w") as f:
         json.dump(payload, f, indent=2)
 
-    plot(samples, out_png)
-    log(f"wrote: {out_json}")
-    log(f"wrote: {out_png}")
+    samples = _extract_or_raise(payload)
+    plot(samples, OUT_PNG)
+    log(f"wrote: {OUT_JSON}")
+    log(f"wrote: {OUT_PNG}")
 
 
 if __name__ == "__main__":

@@ -231,7 +231,8 @@ pub async fn register_webrtc_stream(
             .map_err(|e| WebRtcError::DataChannelFailed(format!("dial: {:?}", e)))?
     } else {
         info!("[WebRTC] Waiting for incoming connection...");
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        // Small delay to allow signaling messages to queue before accept() processes them
+        tokio::time::sleep(Duration::from_millis(100)).await;
         listener
             .accept()
             .await

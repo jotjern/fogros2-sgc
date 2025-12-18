@@ -24,43 +24,29 @@ struct Client {
 }
 
 type ClientMap = Arc<Mutex<HashMap<ClientId, Client>>>;
+type PendingMessages = Arc<Mutex<HashMap<ClientId, Vec<Message>>>>;
 
 // --- Routing State (stored in Redis as {topic_gdp}-routing) ---
+
+/// Edge in the routing tree. Must match core/routing.rs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct Edge {
+    parent: String,
+    child: String,
+}
 
 /// Must match the format used by core/routing.rs for compatibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct RoutingState {
     publishers: Vec<String>,
     proxies: Vec<String>,
-    edges: Vec<String>,
+    edges: Vec<Edge>,
 }
 
-impl RoutingState {
-    fn normalize(&mut self) {
-        self.publishers.sort();
-        self.publishers.dedup();
-        self.proxies.sort();
-        self.proxies.dedup();
-        self.edges.sort();
-        self.edges.dedup();
-    }
-}
-
-fn parse_edge(edge: &str) -> Option<(String, String)> {
-    let parts: Vec<&str> = edge.split('-').collect();
-    if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
-    }
-}
-
-fn build_children_map(edges: &[String]) -> HashMap<String, Vec<String>> {
+fn build_children_map(edges: &[Edge]) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for edge in edges {
-        if let Some((parent, child)) = parse_edge(edge) {
-            map.entry(parent).or_default().push(child);
-        }
+        map.entry(edge.parent.clone()).or_default().push(edge.child.clone());
     }
     for children in map.values_mut() {
         children.sort();
@@ -88,8 +74,15 @@ fn atomic_update(redis_url: &str, key: &str, new_value: &str, old_value: &str) -
     Ok(pipe.query::<Option<Vec<redis::Value>>>(&mut con)?.is_some())
 }
 
+/// Clean up gdpname_map entry for the disconnected node.
+/// Only removes the specific node that disconnected, not its downstream children
+/// (they may still be running and will reconnect to a new parent).
+fn cleanup_gdpname_map(con: &mut redis::Connection, node: &str) -> Result<(), redis::RedisError> {
+    redis::cmd("HDEL").arg("gdpname_map").arg(node).query::<()>(con)?;
+    Ok(())
+}
+
 /// Remove a node and its subtree from the routing state.
-/// Only removes edges, not registry entries (publishers/proxies persist for rejoin).
 fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
     let key = format!("{}-routing", topic_gdp);
     
@@ -119,9 +112,16 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
         let mut state: RoutingState = if old.trim().is_empty() {
             RoutingState::default()
         } else {
-            serde_json::from_str(&old).unwrap_or_default()
+            match serde_json::from_str(&old) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[Signaling] Failed to parse routing state: {} (raw: {})", e, &old[..old.len().min(200)]);
+                    return;
+                }
+            }
         };
-        state.normalize();
+
+        let edges_before = state.edges.len();
 
         // BFS to find all nodes in subtree rooted at `node`
         let children_map = build_children_map(&state.edges);
@@ -141,18 +141,36 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
         }
 
         // Remove edges involving subtree nodes
-        state.edges.retain(|e| {
-            parse_edge(e)
-                .map(|(p, c)| !subtree.contains(&p) && !subtree.contains(&c))
-                .unwrap_or(false)
-        });
-        state.normalize();
+        state.edges.retain(|e| !subtree.contains(&e.parent) && !subtree.contains(&e.child));
+
+        // Also remove the disconnected node from proxies/publishers to prevent re-selection
+        let proxies_before = state.proxies.len();
+        state.proxies.retain(|p| p != node);
+        let proxies_removed = proxies_before - state.proxies.len();
+
+        let publishers_before = state.publishers.len();
+        state.publishers.retain(|p| p != node);
+        let publishers_removed = publishers_before - state.publishers.len();
+
+        let edges_after = state.edges.len();
+        let edges_removed = edges_before - edges_after;
 
         let new_value = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
         
         match atomic_update(redis_url, &key, &new_value, &old) {
             Ok(true) => {
-                println!("[Signaling] Disconnected {} from topic {} (attempt {})", node, topic_gdp, attempt + 1);
+                // Only clean up gdpname_map if this node was actually a proxy/publisher that died
+                // (not just a listener that lost its parent connection temporarily)
+                if proxies_removed > 0 || publishers_removed > 0 {
+                    if let Err(e) = cleanup_gdpname_map(&mut con, node) {
+                        eprintln!("[Signaling] Failed to clean gdpname_map: {}", e);
+                    }
+                }
+                
+                println!(
+                    "[Signaling] Disconnected {} from topic {} (attempt {}, edges_removed={}, proxies_removed={}, publishers_removed={}, subtree: {:?})",
+                    node, topic_gdp, attempt + 1, edges_removed, proxies_removed, publishers_removed, subtree
+                );
                 return;
             }
             Ok(false) => continue, // CAS conflict, retry
@@ -168,7 +186,7 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
 
 // --- WebSocket Connection Handling ---
 
-async fn handle_client(clients: ClientMap, stream: TcpStream) {
+async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, stream: TcpStream) {
     let mut client_id = ClientId::new();
 
     // Extract client ID from URL path during handshake
@@ -194,25 +212,42 @@ async fn handle_client(clients: ClientMap, stream: TcpStream) {
     let my_generation = {
         let mut locked = clients.lock().unwrap();
         let gen = locked.get(&client_id).map(|c| c.generation + 1).unwrap_or(1);
-        locked.insert(client_id.clone(), Client { generation: gen, tx });
+        locked.insert(client_id.clone(), Client { generation: gen, tx: tx.clone() });
         gen
     };
+    
+    // Deliver any pending messages that were buffered before this client connected
+    {
+        let mut pending = pending_messages.lock().unwrap();
+        if let Some(msgs) = pending.remove(&client_id) {
+            for msg in msgs {
+                let _ = tx.unbounded_send(msg);
+            }
+        }
+    }
 
     let (outgoing, incoming) = websocket.split();
     let forward = rx.map(Ok).forward(outgoing);
 
-    // Relay messages to target peer
+    // Relay messages to target peer (buffer if target not yet connected)
     let client_id_for_process = client_id.clone();
+    let pending_for_relay = pending_messages.clone();
     let process = incoming.try_for_each(|msg| {
         if msg.is_text() {
             if let Ok(text) = msg.to_text() {
                 if let Ok(mut content) = json::parse(text) {
                     let target_id = content["id"].to_string();
-                    let locked = clients.lock().unwrap();
+                    content.insert("id", client_id_for_process.clone()).ok();
+                    let msg_to_send = Message::text(json::stringify(content));
                     
-                    if let Some(target) = locked.get(&target_id) {
-                        content.insert("id", client_id_for_process.clone()).ok();
-                        let _ = target.tx.unbounded_send(Message::text(json::stringify(content)));
+                    let clients_locked = clients.lock().unwrap();
+                    if let Some(target) = clients_locked.get(&target_id) {
+                        let _ = target.tx.unbounded_send(msg_to_send);
+                    } else {
+                        // Target not connected yet - buffer the message
+                        drop(clients_locked);
+                        let mut pending = pending_for_relay.lock().unwrap();
+                        pending.entry(target_id).or_default().push(msg_to_send);
                     }
                 }
             }
@@ -242,7 +277,7 @@ async fn handle_client(clients: ClientMap, stream: TcpStream) {
     
     let topic_gdp = parts[0].to_string();
     let self_node = parts[1].to_string();
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://fogros2-sgc-lite-rib-1".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://rib:6379".to_string());
     let clients_for_check = clients.clone();
 
     tokio::spawn(async move {
@@ -273,10 +308,11 @@ async fn main() -> Result<(), std::io::Error> {
 
     let listener = TcpListener::bind(&endpoint).await?;
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+    let pending_messages: PendingMessages = Arc::new(Mutex::new(HashMap::new()));
 
     while let Ok((stream, addr)) = listener.accept().await {
         println!("[Signaling] Connection from {}", addr);
-        tokio::spawn(handle_client(clients.clone(), stream));
+        tokio::spawn(handle_client(clients.clone(), pending_messages.clone(), stream));
     }
 
     Ok(())

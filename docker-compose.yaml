@@ -1,105 +1,110 @@
-name: fogros2-sgc-lite
+name: fogros2-sgc
 
 services:
-    rib: 
-      image: redislabs/redismod
-      ports:
-        - '8002:6379'  # use 8002 for public interface of redis
+  # Redis for routing state
+  rib:
+    image: redislabs/redismod
+    ports:
+      - '8003:6379'
 
-    signal:
-      restart: always
-      build: 
-        context: ./
-        dockerfile: ./Dockerfile
-      init: true
-      ports:
-        - '8000:8000'  # use 8000 for public interface of signaling server
-      command: >
-        /signaling_server
+  # WebRTC signaling server
+  signal:
+    restart: always
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    init: true
+    ports:
+      - '8005:8000'
+    environment:
+      REDIS_URL: "redis://rib:6379"
+    command: /signaling_server
 
-    redisinsight:
-      restart: always
-      image: redislabs/redisinsight:latest
-      ports:
-      - '8001:5540' # use 8002 for public interface of redis insight
-                    # port 5540 is the inside-docker port
+  # Redis GUI (optional, for debugging)
+  redisinsight:
+    restart: always
+    image: redislabs/redisinsight:latest
+    ports:
+      - '8004:5540'
 
-    talker:
-        restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
-        volumes:
-          - "./src:/src" 
-          - "./scripts:/scripts" 
-        depends_on:
-          - rib 
-          - signal
-        environment:
-          SGC_CONFIG: "talker-docker.toml"
-          RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
-          CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
-        init: true
-        command: >
-          bash -c "source /opt/ros/humble/setup.bash; 
-          ros2 run demo_nodes_py talker & 
-          /gdp-router router"
-    listener:
-        restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
-        volumes:
-          - "./src:/src" 
-          - "./scripts:/scripts" 
-        depends_on:
-          - rib
-          - signal
-          - talker
-        environment:
-          SGC_CONFIG: "listener-docker.toml"
-          RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
-          CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
-        # TODO: this is a hack to make sure the subscriber is started after the publisher
-        # will also test the scenario that is opposite
-        init: true
-        command: >
-          bash -c "source /opt/ros/humble/setup.bash; 
-          ros2 run demo_nodes_py listener & 
-          /gdp-router router"
-    proxy:
-        restart: always
-        build: 
-          context: ./
-          dockerfile: ./Dockerfile
-        volumes:
-          - "./src:/src" 
-          - "./scripts:/scripts" 
-        depends_on:
-          - rib
-          - signal
-        environment:
-          SGC_CONFIG: "proxy-docker.toml"
-          RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
-          CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
-        # TODO: this is a hack to make sure the subscriber is started after the publisher
-        # will also test the scenario that is opposite
-        init: true
-        command: >
-          bash -c "source /opt/ros/humble/setup.bash; 
-          /gdp-router router"
+  # Demo: ROS2 talker (publisher)
+  talker:
+    restart: always
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    volumes:
+      - "./src:/src"
+      - "./secrets:/secrets"
+    depends_on:
+      - rib
+      - signal
+    environment:
+      SGC_CONFIG: "talker-docker.toml"
+      RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
+      CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
+    init: true
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash;
+      ros2 run demo_nodes_py talker &
+      /sgc router"
 
-    dashboard:
-        restart: always
-        image: node:18-alpine
-        working_dir: /app
-        volumes:
-          - ./dashboard:/app
-        command: ["sh", "-c", "npm install && npm start"]
-        ports:
-          - '3000:3000'
-        depends_on:
-          - rib
-        environment:
-          REDIS_HOST: rib
-          REDIS_PORT: 6379
+  # Demo: ROS2 listener (subscriber)
+  listener:
+    restart: always
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    volumes:
+      - "./src:/src"
+      - "./secrets:/secrets"
+    depends_on:
+      - rib
+      - signal
+      - talker
+    environment:
+      SGC_CONFIG: "listener-docker.toml"
+      RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
+      CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
+    init: true
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash;
+      ros2 run demo_nodes_py listener &
+      /sgc router"
+
+  # Demo: Proxy (for scaling)
+  proxy:
+    restart: always
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    volumes:
+      - "./src:/src"
+      - "./secrets:/secrets"
+    depends_on:
+      - rib
+      - signal
+    environment:
+      SGC_CONFIG: "proxy-docker.toml"
+      RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
+      CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
+    init: true
+    command: >
+      bash -c "source /opt/ros/humble/setup.bash;
+      /sgc router"
+
+  # Dashboard for visualization
+  dashboard:
+    restart: always
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./dashboard:/app
+    command: ["sh", "-c", "npm install && npm start"]
+    ports:
+      - '3001:3000'
+    depends_on:
+      - rib
+    environment:
+      REDIS_HOST: rib
+      REDIS_PORT: 6379

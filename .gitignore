@@ -171,3 +171,7 @@ cython_debug/
 # Other files
 redis-data/
 dashboard/node_modules
+
+# Group secrets (should not be committed)
+secrets/
+scripts/crypto/

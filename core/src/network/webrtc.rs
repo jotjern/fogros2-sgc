@@ -155,7 +155,7 @@ pub async fn register_webrtc_stream(
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Connect to signaling server
-    let signaling_uri = format!("{}/{}", config.signaling_server_address, my_id);
+    let signaling_uri = format!("{}/{}", config.signaling_server, my_id);
     let (mut ws_write, mut ws_read) = connect_async(&signaling_uri)
         .await
         .map_err(|e| WebRtcError::SignalingConnectionFailed(format!("{:?}", e)))?

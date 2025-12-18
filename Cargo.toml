@@ -1,15 +1,13 @@
 [package]
-name = "gdp-router"
-version = "0.0.1-beta"
+name = "sgc"
+version = "0.1.0"
 authors = ["Eric Chen <kych@berkeley.edu>", "Jiachen Yuan <jcyuan_johnson@berkeley.edu>"]
 edition = "2021"
-repository = "https://github.com/data-capsule/gdp-router"
+repository = "https://github.com/BerkeleyAutomation/fogros2-sgc"
 readme = "README.md"
-license = "Apache 2.0"
-keywords = ["router", "security"]
-description = """
-GDP Router
-"""
+license = "Apache-2.0"
+keywords = ["ros2", "robotics", "networking", "webrtc"]
+description = "FogROS2-SGC: Secure Global Connectivity for ROS2"
 
 [workspace]
 members = [
@@ -23,8 +21,8 @@ members = [
 nightly = ["utils/nightly"]
 
 [dependencies]
-utils = { path = "utils"}
-cli = { path = "cli"}
+utils = { path = "utils" }
+cli = { path = "cli" }
 core = { path = "core" }
 human-panic = "1.0.3"
 better-panic = "0.3.0"
@@ -36,33 +34,12 @@ assert_cmd = "2.0.4"
 predicates = "2.1.1"
 
 [profile.dev]
-opt-level=0
+opt-level = 0
 debug = true
-rpath = false
 lto = false
-debug-assertions = true
-codegen-units = 4
 
 [profile.release]
-opt-level=3
-debug = false
-rpath = false
-lto = true
-debug-assertions = false
-codegen-units = 1
-
-[profile.test]
-opt-level = 1
-debug = true
-rpath = false
-lto = false
-debug-assertions = true
-codegen-units = 4
-
-[profile.bench]
 opt-level = 3
 debug = false
-rpath = false
 lto = true
-debug-assertions = false
 codegen-units = 1

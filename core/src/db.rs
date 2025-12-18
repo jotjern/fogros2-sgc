@@ -10,28 +10,32 @@ use redis_async::client;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use utils::app_config::AppConfig;
 use crate::structs::GDPName;
+
+/// Get Redis URL from config (e.g., "redis://host:6379").
 pub fn get_redis_url() -> String {
     let config = AppConfig::fetch().expect("Failed to fetch config");
-    format!("redis://{}", config.routing_information_base_address)
+    format!("redis://{}", config.routing_server)
 }
 
+/// Parse routing_server into (host, port).
 pub fn get_redis_address_and_port() -> Result<(String, u16), Box<dyn std::error::Error>> {
     let config = AppConfig::fetch().map_err(|e| format!("Failed to fetch config: {}", e))?;
-    let url = config.routing_information_base_address;
-    let mut split = url.split(":");
+    let url = config.routing_server;
+    let mut split = url.split(':');
     let address = split
         .next()
-        .ok_or_else(|| format!("Invalid Redis address format: {}", url))?
+        .ok_or_else(|| format!("Invalid routing_server format: {}", url))?
         .to_string();
     let port_str = split
         .next()
-        .ok_or_else(|| format!("Missing port in Redis address: {}", url))?;
+        .ok_or_else(|| format!("Missing port in routing_server: {}", url))?;
     let port = port_str
         .parse::<u16>()
-        .map_err(|e| format!("Invalid port '{}' in Redis address: {}", port_str, e))?;
+        .map_err(|e| format!("Invalid port '{}': {}", port_str, e))?;
     Ok((address, port))
 }
 
+/// Clear all Redis keys for a topic (for testing/reset).
 pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (address, port) = get_redis_address_and_port()?;
     let client = redis::Client::open(format!("redis://{}:{}", address, port))
@@ -39,7 +43,7 @@ pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut con = client
         .get_connection()
         .map_err(|e| format!("Failed to get Redis connection: {}", e))?;
-    // Clear all topic-related keys
+    
     let keys = [
         format!("{}-routing", topic),
         format!("{}-publishers", topic),
@@ -51,19 +55,12 @@ pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     for k in &keys {
         redis::cmd("DEL").arg(k).query::<()>(&mut con)?;
     }
-    info!("Cleared Redis topic keys for topic: {}", topic);
+    info!("Cleared Redis topic keys for: {}", topic);
     Ok(())
 }
 
-// -----------------------------------------------------------------------------
-// Redis optimistic CAS helpers (WATCH/MULTI/EXEC)
-// -----------------------------------------------------------------------------
-
-/// Try a single optimistic compare-and-swap update for a single Redis key.
-///
-/// Returns:
-/// - `Ok(true)` if the update committed
-/// - `Ok(false)` if the observed value did not match `old_value` or a concurrent writer won
+/// Try a single optimistic compare-and-swap update.
+/// Returns Ok(true) if committed, Ok(false) if concurrent modification.
 pub fn try_atomic_update(
     redis_url: &str,
     key: &str,
@@ -84,12 +81,11 @@ pub fn try_atomic_update(
     let mut pipe = redis::pipe();
     pipe.atomic();
     pipe.set(key, new_value);
-    // If watched key changed, Redis returns Nil -> Option::None.
     let exec_result = pipe.query::<Option<Vec<redis::Value>>>(&mut con)?;
     Ok(exec_result.is_some())
 }
 
-/// Retry optimistic CAS up to `max_retries`.
+/// Retry optimistic CAS up to max_retries times.
 pub fn atomic_update(
     redis_url: &str,
     key: &str,
@@ -111,8 +107,7 @@ pub fn get_string(redis_url: &str, key: &str) -> RedisResult<Option<String>> {
     con.get(key)
 }
 
-// Enable Redis keyspace notifications for dynamic discovery
-// KEA = Keyspace events, Event types All
+/// Enable Redis keyspace notifications (KEA = all events).
 pub fn allow_keyspace_notification(redis_url: &str) -> RedisResult<()> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
@@ -128,18 +123,17 @@ pub fn allow_keyspace_notification(redis_url: &str) -> RedisResult<()> {
                 format!("Failed to set notify-keyspace-events: {}", e),
             ))
         })?;
-    info!("Enabled Redis keyspace notifications (KEA)");
+    info!("Enabled Redis keyspace notifications");
     Ok(())
 }
 
-/// A keyspace notification for a key change (we don't interpret the event type here).
 #[derive(Debug, Clone)]
 pub struct RedisKeyChange {
     pub key: String,
     pub event: String,
 }
 
-/// Watch a Redis key and emit an event on any keyspace notification.
+/// Watch a Redis key via keyspace notifications.
 pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
     let redis_url = get_redis_url();
     if let Err(e) = allow_keyspace_notification(&redis_url) {
@@ -149,9 +143,9 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
     let (host, port) = match get_redis_address_and_port() {
         Ok(addr) => addr,
         Err(e) => {
-            error!("Failed to get Redis address and port: {}", e);
+            error!("Failed to parse routing_server: {}", e);
             let (tx, rx) = unbounded_channel();
-            drop(tx); // Close immediately to signal error
+            drop(tx);
             return rx;
         }
     };
@@ -159,7 +153,7 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
     let pubsub = match client::pubsub_connect(host.clone(), port).await {
         Ok(p) => p,
         Err(e) => {
-            error!("Cannot connect to Redis pubsub at {}:{}: {}", host, port, e);
+            error!("Cannot connect to Redis at {}:{}: {}", host, port, e);
             let (tx, rx) = unbounded_channel();
             drop(tx);
             return rx;
@@ -170,7 +164,7 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
     let mut stream = match pubsub.psubscribe(&keyspace_topic).await {
         Ok(s) => s,
         Err(e) => {
-            error!("Cannot subscribe to keyspace topic '{}': {}", keyspace_topic, e);
+            error!("Cannot subscribe to '{}': {}", keyspace_topic, e);
             let (tx, rx) = unbounded_channel();
             drop(tx);
             return rx;
@@ -181,16 +175,16 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
 
     tokio::spawn(async move {
         while !tx.is_closed() {
-            // Wait for a notification from the redis server
             loop {
                 match stream.next().await {
                     Some(Ok(_msg)) => {
-                        // We only need a wake-up signal to re-fetch state.
-                        // Keep this compatible across redis_async message types.
-                        let _ = tx.send(RedisKeyChange { key: key.clone(), event: "changed".to_string() });
+                        let _ = tx.send(RedisKeyChange { 
+                            key: key.clone(), 
+                            event: "changed".to_string() 
+                        });
                         break;
                     }
-                    Some(Err(e)) => error!("Error when waiting for redis updates: {}", e),
+                    Some(Err(e)) => error!("Redis watch error: {}", e),
                     None => (),
                 }
             }
@@ -200,10 +194,12 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
     rx
 }
 
+/// Get hostname (HOSTNAME env var or "unknown").
 pub fn get_container_name() -> String {
     std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// Store GDP name -> hostname mapping in Redis (for dashboard).
 pub fn publish_gdp_name_mapping(
     redis_url: &str,
     gdp_name: GDPName,
@@ -211,8 +207,14 @@ pub fn publish_gdp_name_mapping(
 ) -> RedisResult<()> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
-    // Keep this simple: a single Redis hash for lookups/debugging.
-    let key = "gdpname_map";
-    let _: () = con.hset(key, gdp_name.to_string(), container_name)?;
+    let _: () = con.hset("gdpname_map", gdp_name.to_string(), container_name)?;
+    Ok(())
+}
+
+/// Test Redis connectivity. Returns Ok(()) if PING succeeds.
+pub fn test_redis_connection(redis_url: &str) -> RedisResult<()> {
+    let client = Client::open(redis_url)?;
+    let mut con = client.get_connection()?;
+    redis::cmd("PING").query::<String>(&mut con)?;
     Ok(())
 }

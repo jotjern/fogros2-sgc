@@ -1,3 +1,7 @@
+//! FogROS2-SGC: Secure Global Connectivity for ROS2
+//!
+//! Connects disjoint ROS2 networks across different locations using WebRTC.
+
 #[cfg(not(debug_assertions))]
 use human_panic::setup_panic;
 
@@ -10,6 +14,7 @@ use utils::app_config::AppConfig;
 use utils::error::Result;
 
 fn main() -> Result<()> {
+    // Setup panic handlers
     #[cfg(not(debug_assertions))]
     {
         setup_panic!();
@@ -24,25 +29,26 @@ fn main() -> Result<()> {
             .install();
     }
 
-    ::std::env::set_var("RUST_LOG", "debug");
+    // Initialize logging (use RUST_LOG env var)
+    if env::var("RUST_LOG").is_err() {
+        env::set_var("RUST_LOG", "info");
+    }
     env_logger::init();
 
-    let include_path = match env::var_os("SGC_CONFIG") {
+    // Load config file
+    let config_path = match env::var_os("SGC_CONFIG") {
         Some(config_file) => {
-            format!(
-                "{}{}",
-                "./src/resources/",
-                config_file.into_string().unwrap()
-            )
+            format!("./src/resources/{}", config_file.into_string().unwrap())
         }
         None => "./src/resources/automatic.toml".to_owned(),
     };
-    println!("Using config file : {}", include_path);
-    let config_contents = fs::read_to_string(include_path).expect("config file not found!");
+
+    let config_contents = fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!("Error: Cannot read config file '{}': {}", config_path, e);
+        std::process::exit(1);
+    });
 
     AppConfig::init(Some(&config_contents))?;
 
-    cli::cli_match()?;
-
-    Ok(())
+    cli::cli_match()
 }

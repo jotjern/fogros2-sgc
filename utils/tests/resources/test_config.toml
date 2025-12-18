@@ -1,4 +1,8 @@
-debug = false
+group_secret = "test"
+signaling_server = "ws://localhost:8000"
+routing_server = "localhost:6379"
 
-[database]
-url = "custom database url"
+[[topics]]
+name = "/test_topic"
+type = "std_msgs/msg/String"
+role = "publisher"

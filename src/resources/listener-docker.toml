@@ -43,3 +43,8 @@ topic_type = "rcl_interfaces/msg/ParameterEvent"
 action = "sub"
 topic_name = "/chatter"
 topic_type = "std_msgs/msg/String"
+
+[[ros]]
+action = "sub"
+topic_name = "/bench_latency"
+topic_type = "builtin_interfaces/msg/Time"

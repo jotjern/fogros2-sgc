@@ -21,7 +21,7 @@ OUT_THR = os.path.join(OUT_DIR, "benchmark1_throughput.png")
 OUT_LAT = os.path.join(OUT_DIR, "benchmark1_latency.png")
 
 # What we want (hardcoded):
-LISTENER_SET = [1, 5, 10, 15, 25]
+LISTENER_SET = [1, 5, 10, 15, 25, 50]
 FANOUT_HIER = 3
 FANOUT_DIRECT = 1000
 MEASURE_SECS = 30
@@ -54,10 +54,11 @@ def run_case(docker_cli, *, mode, fanout, listeners, measure_secs, timeout_secs,
     log("  all listeners connected")
 
     log(f"  measuring throughput for {measure_secs}s...")
-    _d, talker_tx_mbps, listener_rx_mbps = measure_net(docker_cli, measure_secs)
+    _d, talker_tx_mbps, _listener_rx_mbps = measure_net(docker_cli, measure_secs)
 
     log("  parsing listener latency samples from logs...")
     lat = parse_latency_samples_from_logs(docker_cli, only_service="listener")
+    sample_count = sum(len(v) for v in lat.values())
     per_listener_mean = {k: (sum(v) / len(v) if v else 0.0) for k, v in lat.items()}
     means = list(per_listener_mean.values())
     avg_latency_ms = (sum(means) / len(means)) if means else 0.0
@@ -74,10 +75,10 @@ def run_case(docker_cli, *, mode, fanout, listeners, measure_secs, timeout_secs,
         "measure_secs": measure_secs,
         "throughput": {
             "talker_tx_mbps": talker_tx_mbps,
-            "listener_rx_mbps": listener_rx_mbps,
         },
         "latency": {
             "avg_per_listener_mean_ms": avg_latency_ms,
+            "samples": sample_count,
         },
     }
 
@@ -120,9 +121,15 @@ def _extract_or_raise(payload):
         if key not in need:
             continue
         thr = ((r.get("throughput") or {}).get("talker_tx_mbps"))
-        lat = ((r.get("latency") or {}).get("avg_per_listener_mean_ms"))
+        lat_obj = (r.get("latency") or {})
+        lat = lat_obj.get("avg_per_listener_mean_ms")
+        samples = lat_obj.get("samples", 0)
         if thr is None or lat is None:
             raise ValueError(f"run missing throughput/latency: {r}")
+        if float(thr) <= 0.0:
+            raise ValueError(f"run has zero throughput: {r}")
+        if int(samples) <= 0:
+            raise ValueError(f"run has zero latency samples: {r}")
         out[key] = {"thr": float(thr), "lat": float(lat)}
 
     missing = [k for k in sorted(need) if k not in out]

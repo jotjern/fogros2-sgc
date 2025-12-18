@@ -3,8 +3,9 @@
 //! Uses a signaling server to exchange SDP offers/answers and ICE candidates,
 //! then establishes direct WebRTC data channels for GDP packet transfer.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::pipeline::construct_gdp_forward_from_bytes;
@@ -30,12 +31,29 @@ use utils::app_config::AppConfig;
 const RECEIVE_BUFFER_SIZE: usize = 1_748_000; // ~1.7MB for large messages
 const MAX_PARSE_RETRIES: usize = 5;
 
+static ACTIVE_SIGNAL_IDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn active_ids() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_SIGNAL_IDS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub struct WebRtcGuard {
+    id: String,
+}
+
+impl Drop for WebRtcGuard {
+    fn drop(&mut self) {
+        active_ids().lock().remove(&self.id);
+    }
+}
+
 #[derive(Debug)]
 pub enum WebRtcError {
     ConfigError(String),
     PeerConnectionFailed(String),
     SignalingConnectionFailed(String),
     DataChannelFailed(String),
+    DuplicateConnection(String),
 }
 
 impl std::fmt::Display for WebRtcError {
@@ -45,6 +63,7 @@ impl std::fmt::Display for WebRtcError {
             WebRtcError::PeerConnectionFailed(e) => write!(f, "PeerConnection failed: {}", e),
             WebRtcError::SignalingConnectionFailed(e) => write!(f, "Signaling connection failed: {}", e),
             WebRtcError::DataChannelFailed(e) => write!(f, "Data channel failed: {}", e),
+            WebRtcError::DuplicateConnection(id) => write!(f, "Duplicate connection attempt for {}", id),
         }
     }
 }
@@ -132,8 +151,16 @@ struct SignalingMessage {
 pub async fn register_webrtc_stream(
     my_id: &str,
     peer_to_dial: Option<String>,
-) -> Result<(DataStream, broadcast::Sender<()>), WebRtcError> {
+) -> Result<(DataStream, broadcast::Sender<()>, WebRtcGuard), WebRtcError> {
     let my_id = my_id.to_string();
+    {
+        let mut set = active_ids().lock();
+        if set.contains(&my_id) {
+            return Err(WebRtcError::DuplicateConnection(my_id));
+        }
+        set.insert(my_id.clone());
+    }
+    let guard = WebRtcGuard { id: my_id.clone() };
     let is_initiator = peer_to_dial.is_some();
     
     info!("[WebRTC] Setup for {}: mode={}", my_id, if is_initiator { "initiator" } else { "responder" });
@@ -240,7 +267,7 @@ pub async fn register_webrtc_stream(
     };
 
     info!("[WebRTC] Data channel established for {}", my_id);
-    Ok((stream, shutdown_tx))
+    Ok((stream, shutdown_tx, guard))
 }
 
 /// Bidirectional forwarding between WebRTC stream and ROS channels.
@@ -248,6 +275,7 @@ pub async fn webrtc_reader_and_writer(
     mut stream: DataStream,
     ros_tx: UnboundedSender<GDPPacket>,
     mut rtc_rx: UnboundedReceiver<GDPPacket>,
+    _guard: WebRtcGuard,
 ) {
     let thread_name = generate_random_gdp_name();
     let mut parser = PacketParser::new();

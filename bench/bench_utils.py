@@ -153,7 +153,10 @@ def net_snapshot(docker_cli):
     if not ps:
         return out
     cache = {}
-    name_to_service = {getattr(c, "container_name", "") or c.id: service_of(docker_cli, c, cache) for c in ps}
+    name_to_service = {
+        (getattr(c, "container_name", None) or getattr(c, "name", None) or c.id): service_of(docker_cli, c, cache)
+        for c in ps
+    }
     stats = docker_cli.container.stats([c.id for c in ps])
     for s in stats:
         name = s.container_name

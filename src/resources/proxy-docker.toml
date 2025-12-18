@@ -47,3 +47,8 @@ action = "proxy"
 topic_name = "/chatter"
 # topic type of fogros2-sgc node that will publish/subscribe to
 topic_type = "std_msgs/msg/String"
+
+[[ros]]
+action = "proxy"
+topic_name = "/bench_latency"
+topic_type = "builtin_interfaces/msg/Time"

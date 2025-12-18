@@ -44,3 +44,8 @@ topic_type = "rcl_interfaces/msg/ParameterEvent"
 action = "pub"
 topic_name = "/chatter"
 topic_type = "std_msgs/msg/String"
+
+[[ros]]
+action = "pub"
+topic_name = "/bench_latency"
+topic_type = "builtin_interfaces/msg/Time"

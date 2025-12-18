@@ -36,8 +36,10 @@ services:
           - rib 
           - signal
         environment:
-          SGC_CONFIG: "talker-docker.toml"
+          SGC_CONFIG: "${SGC_CONFIG_TALKER:-talker-docker.toml}"
           FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+          BENCH_LATENCY: "${BENCH_LATENCY:-0}"
+          BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
         init: true
@@ -66,8 +68,10 @@ services:
           - signal
           - talker
         environment:
-          SGC_CONFIG: "listener-docker.toml"
+          SGC_CONFIG: "${SGC_CONFIG_LISTENER:-listener-docker.toml}"
           FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+          BENCH_LATENCY: "${BENCH_LATENCY:-0}"
+          BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
         # TODO: this is a hack to make sure the subscriber is started after the publisher
@@ -97,7 +101,7 @@ services:
           - rib
           - signal
         environment:
-          SGC_CONFIG: "proxy-docker.toml"
+          SGC_CONFIG: "${SGC_CONFIG_PROXY:-proxy-docker.toml}"
           FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
           RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
           CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"

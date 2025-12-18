@@ -216,3 +216,19 @@ pub fn publish_gdp_name_mapping(
     let _: () = con.hset(key, gdp_name.to_string(), container_name)?;
     Ok(())
 }
+
+/// Mark a node as having received data (for dashboard visualization).
+/// This is stored in a Redis set for persistence across dashboard sessions.
+pub fn mark_node_received_data(gdp_name: GDPName) {
+    let redis_url = get_redis_url();
+    let result: RedisResult<()> = (|| {
+        let client = Client::open(redis_url)?;
+        let mut con = client.get_connection()?;
+        let key = "nodes_received_data";
+        let _: () = con.sadd(key, gdp_name.to_string())?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        error!("Failed to mark node {} as received data: {}", gdp_name, e);
+    }
+}

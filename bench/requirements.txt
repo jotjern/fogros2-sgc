@@ -1,0 +1,4 @@
+redis>=4.0.0
+python-on-whales>=0.60.0
+matplotlib>=3.8.0
+

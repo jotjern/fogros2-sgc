@@ -66,6 +66,8 @@ pub async fn network_to_ros_forwarder(
     node_name: String, topic_name: String, topic_type: String, certificate: Vec<u8>,
     my_gdp_name: GDPName, mut m_rx: UnboundedReceiver<GDPPacket>,
 ) {
+    use crate::db::mark_node_received_data;
+    
     let node_gdp_name = GDPName(get_gdp_name_from_topic(
         &node_name,
         &topic_type,
@@ -91,11 +93,21 @@ pub async fn network_to_ros_forwarder(
         std::thread::sleep(std::time::Duration::from_millis(100));
     });
 
+    // Track if we've already marked this node as having received data (to avoid spamming Redis)
+    let mut marked_received = false;
+
     while let Some(pkt_to_forward) = m_rx.recv().await {
         if pkt_to_forward.action == GdpAction::Forward {
             info!("new payload to publish ");
             if pkt_to_forward.gdpname == topic_gdp_name {
                 if let Some(payload) = pkt_to_forward.get_byte_payload() {
+                    // Mark this node as having received data (only once per session)
+                    if !marked_received {
+                        mark_node_received_data(my_gdp_name);
+                        marked_received = true;
+                        info!("Marked node {} as having received data", my_gdp_name);
+                    }
+                    
                     fire_debug_signal(&my_gdp_name, &topic_name, "network_receive", payload);
                     if let Err(e) = publisher.publish(payload.clone()) {
                         error!("Failed to publish to ROS topic {}: {:?}", topic_name, e);

@@ -188,6 +188,14 @@ io.on('connection', (socket) => {
       // Fetch GDP name -> container name mappings (stored as a single Redis hash)
       const gdpMappings = await redis.hgetall('gdpname_map');
 
+      // Fetch nodes that have received data (stored as a Redis set by listeners)
+      let nodesReceivedData = [];
+      try {
+        nodesReceivedData = await redis.smembers('nodes_received_data');
+      } catch (e) {
+        // ignore if key doesn't exist
+      }
+
       // Find unconnected nodes (nodes that exist but have no connections)
       const connectedNodes = new Set();
       connections.forEach(conn => {
@@ -212,7 +220,8 @@ io.on('connection', (socket) => {
         topics,
         gdpMappings,
         unconnectedNodes,
-        distressedNodes: Array.from(distressedSet)
+        distressedNodes: Array.from(distressedSet),
+        nodesReceivedData
       });
     } catch (err) {
       console.error('[Dashboard] fetchAndSend failed:', err);

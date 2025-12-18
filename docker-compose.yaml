@@ -43,6 +43,14 @@ services:
         init: true
         command: >
           bash -c "source /opt/ros/humble/setup.bash; 
+          if [ \"${BENCH_LATENCY:-0}\" = \"1\" ]; then
+            echo \"BENCH_LATENCY: starting talker helper\" ;
+            if [ ! -f /scripts/bench_latency_talker.py ]; then
+              echo \"BENCH_LATENCY_ERROR: missing /scripts/bench_latency_talker.py\" ;
+            else
+              (python3 /scripts/bench_latency_talker.py 2>&1 || echo \"BENCH_LATENCY_ERROR: talker helper exited nonzero\") &
+            fi;
+          fi;
           ros2 run demo_nodes_py talker & 
           /gdp-router router"
     listener:
@@ -67,6 +75,14 @@ services:
         init: true
         command: >
           bash -c "source /opt/ros/humble/setup.bash; 
+          if [ \"${BENCH_LATENCY:-0}\" = \"1\" ]; then
+            echo \"BENCH_LATENCY: starting listener helper\" ;
+            if [ ! -f /scripts/bench_latency_listener.py ]; then
+              echo \"BENCH_LATENCY_ERROR: missing /scripts/bench_latency_listener.py\" ;
+            else
+              (python3 /scripts/bench_latency_listener.py 2>&1 || echo \"BENCH_LATENCY_ERROR: listener helper exited nonzero\") &
+            fi;
+          fi;
           ros2 run demo_nodes_py listener & 
           /gdp-router router"
     proxy:

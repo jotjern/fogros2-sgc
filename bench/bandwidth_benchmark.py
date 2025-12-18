@@ -73,13 +73,13 @@ def get_net_stats():
         }
     return stats
 
-def choose_num_proxies(proxy_mode: str, num_listeners: int) -> int:
+def choose_num_proxies(proxy_mode: str, num_listeners: int, fanout_factor: int) -> int:
     if proxy_mode == "none":
         return 0
     if proxy_mode == "one":
         return 1
-    # default/auto-ish behavior: approx ceil(n/3), but always at least 1
-    return max(1, (num_listeners + 2) // 3)
+    f = int(fanout_factor) if int(fanout_factor) > 0 else 1
+    return max(1, ((num_listeners + f - 1) // f) * 2)
 
 
 def run_benchmark(
@@ -92,7 +92,7 @@ def run_benchmark(
 ):
     print(f"\n{'='*50}\nBenchmark: fanout={fanout_factor} listeners={num_listeners}\n{'='*50}")
     
-    num_proxies = proxy_count_override if proxy_count_override is not None else choose_num_proxies(proxy_mode, num_listeners)
+    num_proxies = proxy_count_override if proxy_count_override is not None else choose_num_proxies(proxy_mode, num_listeners, fanout_factor)
     success, connected = False, set()
     for attempt in range(1, 4):
         # Ensure docker-compose variable interpolation + container env pick up the desired fanout.

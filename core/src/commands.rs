@@ -149,13 +149,13 @@ pub fn check() -> Result<()> {
 
 /// Test WebSocket connection to signaling server.
 fn test_signaling_server(url: &str) -> std::result::Result<(), String> {
-    use std::net::TcpStream;
+    use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
     // Parse ws:// or wss:// URL to get host:port
     let url = url.trim_start_matches("ws://").trim_start_matches("wss://");
     let host_port = url.split('/').next().unwrap_or(url);
-    
+
     // Add default port if missing
     let host_port = if host_port.contains(':') {
         host_port.to_string()
@@ -163,11 +163,15 @@ fn test_signaling_server(url: &str) -> std::result::Result<(), String> {
         format!("{}:8000", host_port)
     };
 
-    TcpStream::connect_timeout(
-        &host_port.parse().map_err(|e| format!("Invalid address: {}", e))?,
-        Duration::from_secs(5),
-    )
-    .map_err(|e| e.to_string())?;
+    // Resolve hostname to socket address
+    let addr = host_port
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed: {}", e))?
+        .next()
+        .ok_or_else(|| "No addresses found".to_string())?;
+
+    TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }

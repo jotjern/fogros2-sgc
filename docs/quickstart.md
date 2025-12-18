@@ -5,7 +5,7 @@ Run the demo in under 5 minutes using Docker.
 ## Prerequisites
 
 - Docker and Docker Compose installed
-- That's it.
+- ROS2 Humble installed
 
 ## Run the Demo
 

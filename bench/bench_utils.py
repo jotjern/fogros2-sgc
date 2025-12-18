@@ -149,15 +149,34 @@ def join_latency_from_redis(hostnames, max_wait_secs):
 
 def net_snapshot(docker_cli):
     out = {}
-    ps = docker_cli.compose.ps()
-    if not ps:
-        return out
+    # Docker can occasionally return transient EOFs for `container stats` while
+    # containers are being (re)created. Treat that as retryable; otherwise a
+    # single hiccup kills the whole benchmark run.
+    last_err = None
+    stats = None
+    ps = []
     cache = {}
-    name_to_service = {
-        (getattr(c, "container_name", None) or getattr(c, "name", None) or c.id): service_of(docker_cli, c, cache)
-        for c in ps
-    }
-    stats = docker_cli.container.stats([c.id for c in ps])
+    name_to_service = {}
+    for attempt in range(5):
+        ps = docker_cli.compose.ps()
+        if not ps:
+            return out
+        cache = {}
+        name_to_service = {
+            (getattr(c, "container_name", None) or getattr(c, "name", None) or c.id): service_of(docker_cli, c, cache)
+            for c in ps
+        }
+        try:
+            stats = docker_cli.container.stats([c.id for c in ps])
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.3 * (attempt + 1))
+            continue
+    if stats is None:
+        raise RuntimeError(f"failed to read docker stats after retries: {last_err}")
+
     for s in stats:
         name = s.container_name
         svc = name_to_service.get(name) or "unknown"

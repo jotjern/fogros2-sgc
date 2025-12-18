@@ -3,23 +3,33 @@ import os
 import time
 
 import rclpy
-from builtin_interfaces.msg import Time as TimeMsg
 from rclpy.node import Node
+from std_msgs.msg import String
 
 
 class LatencyListener(Node):
     def __init__(self):
         super().__init__("bench_latency_listener")
-        topic = os.environ.get("BENCH_LATENCY_TOPIC", "/bench_latency")
+        # Subscribe on /chatter (single-topic benchmark mode). We'll only process
+        # messages tagged by bench_latency_talker.
+        topic = os.environ.get("BENCH_LATENCY_TOPIC", "/chatter")
         self.samples = []
         self.max_samples = int(os.environ.get("BENCH_LATENCY_MAX_SAMPLES", "2000"))
-        self.sub = self.create_subscription(TimeMsg, topic, self._cb, 10)
+        self.sub = self.create_subscription(String, topic, self._cb, 10)
         self.last_print = time.time()
         self.print_every = float(os.environ.get("BENCH_LATENCY_PRINT_EVERY_SECS", "1.0"))
 
-    def _cb(self, msg: TimeMsg):
+    def _cb(self, msg: String):
+        data = msg.data or ""
+        prefix = "BENCH_LATENCY_SENT_NS="
+        if not data.startswith(prefix):
+            return
+
         now = self.get_clock().now()
-        sent_ns = int(msg.sec) * 1_000_000_000 + int(msg.nanosec)
+        try:
+            sent_ns = int(data[len(prefix) :].strip())
+        except Exception:
+            return
         recv_ns = int(now.nanoseconds)
         lat_ms = max(0.0, (recv_ns - sent_ns) / 1e6)
 

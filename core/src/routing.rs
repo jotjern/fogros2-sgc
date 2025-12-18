@@ -9,13 +9,15 @@
 //! - `edges` contains unique (parent, child) pairs.
 //! - For all parents, `children.len() <= fanout()`.
 
-use crate::db::{atomic_update, get_string};
+use crate::db::{atomic_update, get_container_name, get_string};
 use crate::structs::{Connection, GDPName};
 use log::{debug, info, warn};
+use redis::Commands;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_FANOUT: usize = 3;
 const MAX_RETRIES: usize = 32;
@@ -235,6 +237,26 @@ pub fn register_proxy(redis_url: &str, topic_gdp: GDPName, proxy: GDPName, topic
 pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscriber: GDPName) -> Result<(), String> {
     let key = routing_key(topic_gdp);
     let subscriber_s = subscriber.to_string();
+
+    // Benchmark hook: mark when this node begins routing subscribe attempts.
+    // Uses container hostname as the stable per-node identifier.
+    // Stored once (HSETNX) so retries don't overwrite.
+    let _ = (|| -> Result<(), ()> {
+        let client = redis::Client::open(redis_url).map_err(|_| ())?;
+        let mut con = client.get_connection().map_err(|_| ())?;
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ())?
+            .as_millis() as i64;
+        let field = get_container_name();
+        let _: i32 = redis::cmd("HSETNX")
+            .arg("bench_join_attempt_ms")
+            .arg(field)
+            .arg(ts_ms)
+            .query(&mut con)
+            .map_err(|_| ())?;
+        Ok(())
+    })();
 
     for attempt in 0..MAX_RETRIES {
         let old = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();

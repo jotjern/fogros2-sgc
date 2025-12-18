@@ -12,7 +12,12 @@ REDIS_PORT = 8002
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_TIMEOUT_SECS = 180
 DEFAULT_MEASURE_SECS = 30
-DEFAULT_OUT_JSON = os.path.join(PROJECT_DIR, "bench", "results", "bandwidth_results.json")
+DEFAULT_OUT_JSON = None
+
+
+def default_out_path():
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return os.path.join(PROJECT_DIR, "bench", "results", f"bandwidth_results_{ts}.json")
 
 docker = DockerClient(compose_files=[os.path.join(PROJECT_DIR, "docker-compose.yaml")])
 
@@ -149,7 +154,7 @@ if __name__ == "__main__":
     ap.add_argument("--timeout-secs", type=int, default=DEFAULT_TIMEOUT_SECS)
     ap.add_argument("--proxy-mode", choices=["auto", "one", "none"], default="auto")
     ap.add_argument("--proxies", type=int, default=None, help="Override number of proxy containers to scale to (e.g. 5).")
-    ap.add_argument("--out", default=DEFAULT_OUT_JSON, help="Output JSON path (overwritten each run).")
+    ap.add_argument("--out", default=DEFAULT_OUT_JSON, help="Output JSON path.")
     args = ap.parse_args()
 
     listener_counts = [int(x.strip()) for x in args.listeners.split(",") if x.strip()]
@@ -159,7 +164,7 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
     
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = args.out
+    out_path = args.out or default_out_path()
 
     # Overwrite the same JSON each run, but keep it incrementally updated
     # after each benchmark so partial results are still usable if interrupted.

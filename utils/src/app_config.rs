@@ -115,8 +115,8 @@ impl AppConfig {
 
         if self.signaling_server.is_empty() {
             errors.push("signaling_server cannot be empty".to_string());
-        } else if !self.signaling_server.starts_with("ws://") 
-            && !self.signaling_server.starts_with("wss://") 
+        } else if !self.signaling_server.starts_with("ws://")
+            && !self.signaling_server.starts_with("wss://")
         {
             errors.push(format!(
                 "signaling_server must start with ws:// or wss://, got: {}",

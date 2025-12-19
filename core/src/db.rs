@@ -3,14 +3,14 @@
 //! Provides optimistic CAS updates (WATCH/MULTI/EXEC) for routing state,
 //! keyspace notifications for dynamic discovery, and GDP name mapping.
 
+use crate::structs::GDPName;
 use futures::StreamExt;
 use log::{error, info};
 use redis::{self, Client, Commands, RedisResult};
 use redis_async::client;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use utils::app_config::AppConfig;
-use crate::structs::GDPName;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get Redis URL from config (e.g., "redis://host:6379").
 pub fn get_redis_url() -> String {
@@ -44,7 +44,7 @@ pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut con = client
         .get_connection()
         .map_err(|e| format!("Failed to get Redis connection: {}", e))?;
-    
+
     let keys = [
         format!("{}-routing", topic),
         format!("{}-publishers", topic),
@@ -63,10 +63,7 @@ pub fn clear_topic_key(topic: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Try a single optimistic compare-and-swap update.
 /// Returns Ok(true) if committed, Ok(false) if concurrent modification.
 pub fn try_atomic_update(
-    redis_url: &str,
-    key: &str,
-    new_value: &str,
-    old_value: &str,
+    redis_url: &str, key: &str, new_value: &str, old_value: &str,
 ) -> RedisResult<bool> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
@@ -88,11 +85,7 @@ pub fn try_atomic_update(
 
 /// Retry optimistic CAS up to max_retries times.
 pub fn atomic_update(
-    redis_url: &str,
-    key: &str,
-    new_value: &str,
-    old_value: &str,
-    max_retries: usize,
+    redis_url: &str, key: &str, new_value: &str, old_value: &str, max_retries: usize,
 ) -> RedisResult<bool> {
     for _ in 0..max_retries {
         if try_atomic_update(redis_url, key, new_value, old_value)? {
@@ -179,9 +172,9 @@ pub async fn watch_redis_key(key: String) -> UnboundedReceiver<RedisKeyChange> {
             loop {
                 match stream.next().await {
                     Some(Ok(_msg)) => {
-                        let _ = tx.send(RedisKeyChange { 
-                            key: key.clone(), 
-                            event: "changed".to_string() 
+                        let _ = tx.send(RedisKeyChange {
+                            key: key.clone(),
+                            event: "changed".to_string(),
                         });
                         break;
                     }
@@ -202,9 +195,7 @@ pub fn get_container_name() -> String {
 
 /// Store GDP name -> hostname mapping in Redis (for dashboard).
 pub fn publish_gdp_name_mapping(
-    redis_url: &str,
-    gdp_name: GDPName,
-    container_name: &str,
+    redis_url: &str, gdp_name: GDPName, container_name: &str,
 ) -> RedisResult<()> {
     let client = Client::open(redis_url)?;
     let mut con = client.get_connection()?;
@@ -251,7 +242,9 @@ pub fn mark_node_received_data(gdp_name: GDPName) {
 
 /// Set a heartbeat key for this proxy with TTL.
 /// Other nodes can check if proxy is alive by checking if key exists.
-pub fn set_proxy_heartbeat(redis_url: &str, topic_gdp: GDPName, proxy: GDPName, ttl_secs: u64) -> Result<(), String> {
+pub fn set_proxy_heartbeat(
+    redis_url: &str, topic_gdp: GDPName, proxy: GDPName, ttl_secs: u64,
+) -> Result<(), String> {
     let key = format!("{}-proxy-alive-{}", topic_gdp, proxy);
     let client = Client::open(redis_url).map_err(|e| e.to_string())?;
     let mut con = client.get_connection().map_err(|e| e.to_string())?;

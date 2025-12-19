@@ -67,7 +67,7 @@ pub async fn network_to_ros_forwarder(
     my_gdp_name: GDPName, mut m_rx: UnboundedReceiver<GDPPacket>,
 ) {
     use crate::db::mark_node_received_data;
-    
+
     let node_gdp_name = GDPName(get_gdp_name_from_topic(
         &node_name,
         &topic_type,
@@ -107,7 +107,7 @@ pub async fn network_to_ros_forwarder(
                         marked_received = true;
                         info!("Marked node {} as having received data", my_gdp_name);
                     }
-                    
+
                     fire_debug_signal(&my_gdp_name, &topic_name, "network_receive", payload);
                     if let Err(e) = publisher.publish(payload.clone()) {
                         error!("Failed to publish to ROS topic {}: {:?}", topic_name, e);
@@ -163,7 +163,8 @@ pub async fn ros_to_network_forwarder(
         info!("received a packet {:?}", packet);
         let ros_msg = packet;
         fire_debug_signal(&node_gdp_name, &topic_name, "ros_receive", &ros_msg);
-        let packet = construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg.clone());
+        let packet =
+            construct_gdp_forward_from_bytes(topic_gdp_name, node_gdp_name, ros_msg.clone());
         if m_tx.send(packet).is_err() {
             break;
         }

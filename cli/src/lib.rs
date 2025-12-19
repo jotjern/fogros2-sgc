@@ -1,5 +1,8 @@
 use clap::{AppSettings, IntoApp, Parser, Subcommand};
-use clap_complete::{generate, shells::{Bash, Fish, Zsh}};
+use clap_complete::{
+    generate,
+    shells::{Bash, Fish, Zsh},
+};
 use core::commands;
 use std::path::PathBuf;
 use utils::app_config::AppConfig;

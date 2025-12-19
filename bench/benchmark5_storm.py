@@ -321,7 +321,7 @@ def plot(results):
     
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Throughput (Mbps)")
-    ax.set_title(f"Storm: {summary.get('recovery_pct', 0):.0f}% recovery")
+    ax.set_title("Storm Resilience")
     ax.legend(loc="lower right")
     ax.set_ylim(bottom=0)
     

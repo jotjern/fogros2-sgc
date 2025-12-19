@@ -61,9 +61,13 @@ impl std::fmt::Display for WebRtcError {
         match self {
             WebRtcError::ConfigError(e) => write!(f, "Config error: {}", e),
             WebRtcError::PeerConnectionFailed(e) => write!(f, "PeerConnection failed: {}", e),
-            WebRtcError::SignalingConnectionFailed(e) => write!(f, "Signaling connection failed: {}", e),
+            WebRtcError::SignalingConnectionFailed(e) => {
+                write!(f, "Signaling connection failed: {}", e)
+            }
             WebRtcError::DataChannelFailed(e) => write!(f, "Data channel failed: {}", e),
-            WebRtcError::DuplicateConnection(id) => write!(f, "Duplicate connection attempt for {}", id),
+            WebRtcError::DuplicateConnection(id) => {
+                write!(f, "Duplicate connection attempt for {}", id)
+            }
         }
     }
 }
@@ -125,7 +129,10 @@ impl PacketParser {
                         None => {
                             self.parse_retries += 1;
                             if self.parse_retries > MAX_PARSE_RETRIES {
-                                warn!("Failed to parse header after {} attempts, clearing buffer", MAX_PARSE_RETRIES);
+                                warn!(
+                                    "Failed to parse header after {} attempts, clearing buffer",
+                                    MAX_PARSE_RETRIES
+                                );
                                 self.buffer.clear();
                                 self.parse_retries = 0;
                             }
@@ -149,8 +156,7 @@ struct SignalingMessage {
 /// Establish WebRTC data channel via signaling server.
 /// Returns the data stream and a shutdown sender for cleanup.
 pub async fn register_webrtc_stream(
-    my_id: &str,
-    peer_to_dial: Option<String>,
+    my_id: &str, peer_to_dial: Option<String>,
 ) -> Result<(DataStream, broadcast::Sender<()>, WebRtcGuard), WebRtcError> {
     let my_id = my_id.to_string();
     {
@@ -162,11 +168,18 @@ pub async fn register_webrtc_stream(
     }
     let guard = WebRtcGuard { id: my_id.clone() };
     let is_initiator = peer_to_dial.is_some();
-    
-    info!("[WebRTC] Setup for {}: mode={}", my_id, if is_initiator { "initiator" } else { "responder" });
 
-    let config = AppConfig::fetch()
-        .map_err(|e| WebRtcError::ConfigError(e.to_string()))?;
+    info!(
+        "[WebRTC] Setup for {}: mode={}",
+        my_id,
+        if is_initiator {
+            "initiator"
+        } else {
+            "responder"
+        }
+    );
+
+    let config = AppConfig::fetch().map_err(|e| WebRtcError::ConfigError(e.to_string()))?;
 
     // STUN server for NAT traversal
     let ice_servers = vec!["stun:stun.l.google.com:19302"];
@@ -205,13 +218,16 @@ pub async fn register_webrtc_stream(
                 Some(m) = rx_sig_outbound.next() => pending.push_back(m),
                 else => break,
             }
-            
+
             let Some(peer_id) = other_peer_writer.lock().clone() else {
                 continue;
             };
-            
+
             while let Some(msg) = pending.pop_front() {
-                let m = SignalingMessage { payload: msg, id: peer_id.clone() };
+                let m = SignalingMessage {
+                    payload: msg,
+                    id: peer_id.clone(),
+                };
                 if let Ok(s) = serde_json::to_string(&m) {
                     if ws_write.send(tungstenite::Message::text(s)).await.is_err() {
                         error!("[WebRTC] Signaling write failed for {}", my_id_w);
@@ -230,14 +246,14 @@ pub async fn register_webrtc_stream(
                 _ = shutdown_rx_r.recv() => break,
                 msg = ws_read.next() => {
                     let Some(Ok(m)) = msg else { break };
-                    
+
                     let val = match m {
                         tungstenite::Message::Text(t) => serde_json::from_str(&t).ok(),
                         tungstenite::Message::Binary(b) => serde_json::from_slice(&b).ok(),
                         tungstenite::Message::Close(_) => break,
                         _ => continue,
                     };
-                    
+
                     if let Some(c) = val.and_then(|v: serde_json::Value| {
                         serde_json::from_value::<SignalingMessage>(v).ok()
                     }) {
@@ -272,10 +288,8 @@ pub async fn register_webrtc_stream(
 
 /// Bidirectional forwarding between WebRTC stream and ROS channels.
 pub async fn webrtc_reader_and_writer(
-    mut stream: DataStream,
-    ros_tx: UnboundedSender<GDPPacket>,
-    mut rtc_rx: UnboundedReceiver<GDPPacket>,
-    _guard: WebRtcGuard,
+    mut stream: DataStream, ros_tx: UnboundedSender<GDPPacket>,
+    mut rtc_rx: UnboundedReceiver<GDPPacket>, _guard: WebRtcGuard,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let thread_name = generate_random_gdp_name();
@@ -325,7 +339,7 @@ pub async fn webrtc_reader_and_writer(
                 let header = pkt.get_header();
                 let mut data = serde_json::to_vec(&header).unwrap_or_default();
                 data.push(0); // Null delimiter
-                
+
                 if let Some(payload) = &pkt.payload {
                     data.extend_from_slice(payload);
                 }
@@ -344,5 +358,8 @@ pub async fn webrtc_reader_and_writer(
         }
     }
 
-    info!("[WebRTC] Connection closed. Stats: received={}, sent={}", stats.0, stats.1);
+    info!(
+        "[WebRTC] Connection closed. Stats: received={}, sent={}",
+        stats.0, stats.1
+    );
 }

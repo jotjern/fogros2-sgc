@@ -52,18 +52,30 @@ OUT_DIR = os.path.join(PROJECT_DIR, "bench", "results")
 OUT_JSON = os.path.join(OUT_DIR, "benchmark3_join.json")
 OUT_PNG = os.path.join(OUT_DIR, "benchmark3_join.png")
 
-SUBSCRIBER_COUNTS = [1, 5, 10, 15, 20, 25, 30]
+_DEFAULT_COUNTS = [1, 5, 10, 15, 20, 25, 30]
+_only_n = os.environ.get("BENCH3_ONLY_N")
+if _only_n:
+    SUBSCRIBER_COUNTS = [int(_only_n)]
+else:
+    SUBSCRIBER_COUNTS = list(_DEFAULT_COUNTS)
 FANOUT = 3
 PUBLISH_HZ = 10.0          # Message rate (for ideal calculation)
 TIMEOUT_SECS = 180
 JOIN_WAIT_SECS = 60.0      # Max time to collect join data
+TRIALS = int(os.environ.get("BENCH3_TRIALS", "1"))
+ONLY_MODE = os.environ.get("BENCH3_ONLY_MODE")  # "hierarchical" or "direct"
+DUMP_LOGS = os.environ.get("BENCH3_DUMP_LOGS", "0") in ("1", "true", "TRUE", "yes", "YES")
 
 
 # -----------------------------------------------------------------------------
 # Benchmark Logic
 # -----------------------------------------------------------------------------
 def run_single(docker_cli, mode: str, n_subscribers: int) -> dict:
-    """Run one test case."""
+    """Run one test case (optionally repeated TRIALS times).
+
+    We pool per-listener join measurements across trials to get more stable
+    tail statistics (p95 in particular) for hierarchical routing.
+    """
     
     if mode == "direct":
         fanout, proxies = 1000, 0
@@ -71,48 +83,84 @@ def run_single(docker_cli, mode: str, n_subscribers: int) -> dict:
         fanout = FANOUT
         proxies = choose_proxies(n_subscribers, fanout)
     
-    log(f"\n=== {mode} | subscribers={n_subscribers} ===")
+    log(f"\n=== {mode} | subscribers={n_subscribers} | trials={TRIALS} ===")
     
     os.environ["FANOUT_FACTOR"] = str(fanout)
     os.environ["BENCH_LATENCY"] = "1"
     os.environ["BENCH_LATENCY_HZ"] = str(PUBLISH_HZ)
     
-    teardown(docker_cli, volumes=True)
-    compose_up(docker_cli, listeners=n_subscribers, proxies=proxies, env=None)
-    
-    if not wait_for_listeners(n_subscribers, TIMEOUT_SECS):
+    all_vals = []
+    per_trial = []
+    success_trials = 0
+    for trial in range(TRIALS):
+        log(f"  trial {trial+1}/{TRIALS}...")
         teardown(docker_cli, volumes=True)
-        return {"success": False, "error": "timeout"}
-    
-    # Collect join latency from Redis
-    log(f"  collecting join latency (up to {JOIN_WAIT_SECS}s)...")
-    hostnames = listener_hostnames(docker_cli)
-    join_ms = join_latency_from_redis(hostnames, JOIN_WAIT_SECS)
-    
-    vals = list(join_ms.values())
-    missing = len(hostnames) - len(vals)
-    
-    if vals:
-        mean, std = mean_std(vals)
-        p50 = percentile(vals, 50)
-        p95 = percentile(vals, 95)
+        compose_up(docker_cli, listeners=n_subscribers, proxies=proxies, env=None)
+
+        if not wait_for_listeners(n_subscribers, TIMEOUT_SECS):
+            teardown(docker_cli, volumes=True)
+            per_trial.append({"trial": trial + 1, "success": False, "error": "timeout"})
+            continue
+
+        # Collect join latency from Redis
+        log(f"    collecting join latency (up to {JOIN_WAIT_SECS}s)...")
+        hostnames = listener_hostnames(docker_cli)
+        join_ms = join_latency_from_redis(hostnames, JOIN_WAIT_SECS)
+
+        vals = list(join_ms.values())
+        missing = len(hostnames) - len(vals)
+        all_vals.extend(vals)
+        success_trials += 1
+        per_trial.append({
+            "trial": trial + 1,
+            "success": True,
+            "collected": len(vals),
+            "missing": missing,
+        })
+        log(f"    collected={len(vals)} missing={missing}")
+
+        if DUMP_LOGS:
+            log("    dumping container logs...")
+            log_dir = os.path.join(OUT_DIR, "benchmark3_logs", f"{mode}_n{n_subscribers}_trial{trial+1}")
+            os.makedirs(log_dir, exist_ok=True)
+            ps = docker_cli.compose.ps()
+            log(f"    containers: {len(ps)}")
+            for c in ps:
+                name = getattr(c, "name", None) or getattr(c, "container_name", None) or c.id
+                safe = str(name).replace("/", "_")
+                try:
+                    txt = docker_cli.container.logs(c.id)
+                except Exception as e:
+                    txt = f"(error fetching logs: {e})\n"
+                if isinstance(txt, bytes):
+                    txt = txt.decode("utf-8", errors="replace")
+                with open(os.path.join(log_dir, f"{safe}.log"), "w", encoding="utf-8") as f:
+                    f.write(txt or "")
+            log(f"    logs saved to {log_dir}/")
+
+        teardown(docker_cli, volumes=True)
+
+    if all_vals:
+        mean, std = mean_std(all_vals)
+        p50 = percentile(all_vals, 50)
+        p95 = percentile(all_vals, 95)
     else:
         mean = std = p50 = p95 = 0.0
     
-    log(f"  collected={len(vals)} missing={missing} p50={p50:.0f}ms p95={p95:.0f}ms")
-    
-    teardown(docker_cli, volumes=True)
-    
     return {
-        "success": True,
+        "success": success_trials > 0,
         "mode": mode,
         "subscribers": n_subscribers,
-        "collected": len(vals),
-        "missing": missing,
+        "trials": TRIALS,
+        "success_trials": success_trials,
+        "collected": len(all_vals),
+        "expected": int(n_subscribers) * int(TRIALS),
+        "missing": (int(n_subscribers) * int(TRIALS)) - len(all_vals),
         "mean_ms": mean,
         "std_ms": std,
         "p50_ms": p50,
         "p95_ms": p95,
+        "per_trial": per_trial,
     }
 
 
@@ -123,11 +171,15 @@ def run_benchmark():
         "fanout": FANOUT,
         "publish_hz": PUBLISH_HZ,
         "ideal_avg_ms": 1000 / (2 * PUBLISH_HZ),  # Theoretical minimum
+        "trials": TRIALS,
+        "only_mode": ONLY_MODE,
     }}
     
     for n in SUBSCRIBER_COUNTS:
-        results["runs"].append(run_single(docker_cli, "hierarchical", n))
-        results["runs"].append(run_single(docker_cli, "direct", n))
+        if ONLY_MODE in (None, "", "hierarchical"):
+            results["runs"].append(run_single(docker_cli, "hierarchical", n))
+        if ONLY_MODE in (None, "", "direct"):
+            results["runs"].append(run_single(docker_cli, "direct", n))
         with open(OUT_JSON, "w") as f:
             json.dump(results, f, indent=2)
     
@@ -195,7 +247,10 @@ def plot(results):
 def validate(results):
     if not results.get("runs"):
         return False
-    need = {(n, m) for n in SUBSCRIBER_COUNTS for m in ["hierarchical", "direct"]}
+    modes = ["hierarchical", "direct"]
+    if ONLY_MODE in ("hierarchical", "direct"):
+        modes = [ONLY_MODE]
+    need = {(n, m) for n in SUBSCRIBER_COUNTS for m in modes}
     have = {(r["subscribers"], r["mode"]) for r in results["runs"] 
             if r.get("success") and r.get("collected", 0) > 0}
     return need == have

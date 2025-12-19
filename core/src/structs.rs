@@ -19,10 +19,10 @@ use strum_macros::EnumIter;
 pub enum GdpAction {
     #[default]
     Noop = 0,
-    Forward = 1,      // Forward payload to destination
-    Advertise = 2,    // Announce topic availability
+    Forward = 1,   // Forward payload to destination
+    Advertise = 2, // Announce topic availability
     AdvertiseResponse = 3,
-    RibGet = 4,       // Query routing information
+    RibGet = 4, // Query routing information
     RibReply = 5,
     Nack = 6,
     Control = 7,
@@ -31,12 +31,18 @@ pub enum GdpAction {
 /// 4-byte unique identifier for topics/nodes.
 /// Derived from SHA256(topic_name, topic_type, cert)[0..4].
 /// Same inputs always produce the same GDPName across all nodes.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Deserialize, Hash, Default)]
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Serialize, Deserialize, Hash, Default,
+)]
 pub struct GDPName(pub [u8; 4]);
 
 impl fmt::Display for GDPName {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:02x}{:02x}{:02x}{:02x}", self.0[0], self.0[1], self.0[2], self.0[3])
+        write!(
+            f,
+            "{:02x}{:02x}{:02x}{:02x}",
+            self.0[0], self.0[1], self.0[2], self.0[3]
+        )
     }
 }
 
@@ -75,7 +81,7 @@ pub fn get_gdp_name_from_topic(topic_name: &str, topic_type: &str, cert: &[u8]) 
     hasher.update(topic_type);
     hasher.update(cert);
     let result = hasher.finalize();
-    
+
     let mut bytes = [0u8; 4];
     bytes.copy_from_slice(&result[..4]);
     bytes
@@ -85,7 +91,7 @@ pub fn get_gdp_name_from_topic(topic_name: &str, topic_type: &str, cert: &[u8]) 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub struct GDPPacket {
     pub action: GdpAction,
-    pub gdpname: GDPName,      // Destination
+    pub gdpname: GDPName, // Destination
     pub source: GDPName,
     pub payload: Option<Vec<u8>>,
     pub name_record: Option<GDPNameRecord>,
@@ -96,7 +102,7 @@ pub struct GDPPacket {
 pub struct GDPHeaderInTransit {
     pub action: GdpAction,
     pub destination: GDPName,
-    pub length: usize,         // Length of payload that follows
+    pub length: usize, // Length of payload that follows
 }
 
 pub(crate) trait Packet {
@@ -110,13 +116,15 @@ impl Packet for GDPPacket {
     }
 
     fn get_header(&self) -> GDPHeaderInTransit {
-        let name_record_len = self.name_record.as_ref()
+        let name_record_len = self
+            .name_record
+            .as_ref()
             .and_then(|r| serde_json::to_string(r).ok())
             .map(|s| s.len())
             .unwrap_or(0);
-        
+
         let payload_len = self.payload.as_ref().map(|p| p.len()).unwrap_or(0);
-        
+
         GDPHeaderInTransit {
             action: self.action,
             destination: self.gdpname,
@@ -147,17 +155,17 @@ pub struct GDPNameRecord {
     pub source_gdpname: GDPName,
     pub webrtc_offer: Option<String>,
     pub ip_address: Option<String>,
-    pub ros: Option<(String, String)>,  // (topic_name, topic_type)
-    pub indirect: Option<GDPName>,       // For forwarding to another node
+    pub ros: Option<(String, String)>, // (topic_name, topic_type)
+    pub indirect: Option<GDPName>,     // For forwarding to another node
 }
 
 #[derive(Debug, PartialEq, Clone, Serialize, Deserialize)]
 pub enum GDPNameRecordType {
     EMPTY,
-    INFO,    // Inform existence, don't replace
+    INFO, // Inform existence, don't replace
     QUERY,
-    UPDATE,  // Replace existing
-    MERGE,   // Merge with existing
+    UPDATE, // Replace existing
+    MERGE,  // Merge with existing
     DELETE,
 }
 
@@ -182,7 +190,7 @@ impl FromStr for Connection {
         if parts.len() != 2 {
             return Err("invalid".parse::<i32>().unwrap_err());
         }
-        
+
         Ok(Connection {
             publisher: GDPName::from_str(parts[0])?,
             subscriber: GDPName::from_str(parts[1])?,

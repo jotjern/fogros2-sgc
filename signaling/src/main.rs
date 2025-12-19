@@ -46,7 +46,9 @@ struct RoutingState {
 fn build_children_map(edges: &[Edge]) -> HashMap<String, Vec<String>> {
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
     for edge in edges {
-        map.entry(edge.parent.clone()).or_default().push(edge.child.clone());
+        map.entry(edge.parent.clone())
+            .or_default()
+            .push(edge.child.clone());
     }
     for children in map.values_mut() {
         children.sort();
@@ -56,18 +58,20 @@ fn build_children_map(edges: &[Edge]) -> HashMap<String, Vec<String>> {
 }
 
 /// Atomically update Redis key using WATCH/MULTI/EXEC (optimistic locking).
-fn atomic_update(redis_url: &str, key: &str, new_value: &str, old_value: &str) -> Result<bool, redis::RedisError> {
+fn atomic_update(
+    redis_url: &str, key: &str, new_value: &str, old_value: &str,
+) -> Result<bool, redis::RedisError> {
     let client = redis::Client::open(redis_url)?;
     let mut con = client.get_connection()?;
-    
+
     redis::cmd("WATCH").arg(key).query::<()>(&mut con)?;
     let current: Option<String> = redis::cmd("GET").arg(key).query(&mut con)?;
-    
+
     if current.unwrap_or_default() != old_value {
         let _ = redis::cmd("UNWATCH").query::<()>(&mut con);
         return Ok(false);
     }
-    
+
     let mut pipe = redis::pipe();
     pipe.atomic();
     pipe.set(key, new_value);
@@ -78,14 +82,17 @@ fn atomic_update(redis_url: &str, key: &str, new_value: &str, old_value: &str) -
 /// Only removes the specific node that disconnected, not its downstream children
 /// (they may still be running and will reconnect to a new parent).
 fn cleanup_gdpname_map(con: &mut redis::Connection, node: &str) -> Result<(), redis::RedisError> {
-    redis::cmd("HDEL").arg("gdpname_map").arg(node).query::<()>(con)?;
+    redis::cmd("HDEL")
+        .arg("gdpname_map")
+        .arg(node)
+        .query::<()>(con)?;
     Ok(())
 }
 
 /// Remove a node and its subtree from the routing state.
 fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
     let key = format!("{}-routing", topic_gdp);
-    
+
     for attempt in 0..32 {
         let client = match redis::Client::open(redis_url) {
             Ok(c) => c,
@@ -94,7 +101,7 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
                 return;
             }
         };
-        
+
         let mut con = match client.get_connection() {
             Ok(c) => c,
             Err(e) => {
@@ -102,7 +109,7 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
                 return;
             }
         };
-        
+
         let old: String = redis::cmd("GET")
             .arg(&key)
             .query(&mut con)
@@ -115,7 +122,11 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
             match serde_json::from_str(&old) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[Signaling] Failed to parse routing state: {} (raw: {})", e, &old[..old.len().min(200)]);
+                    eprintln!(
+                        "[Signaling] Failed to parse routing state: {} (raw: {})",
+                        e,
+                        &old[..old.len().min(200)]
+                    );
                     return;
                 }
             }
@@ -129,7 +140,7 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
         let mut queue = VecDeque::new();
         subtree.insert(node.to_string());
         queue.push_back(node.to_string());
-        
+
         while let Some(n) = queue.pop_front() {
             if let Some(children) = children_map.get(&n) {
                 for child in children {
@@ -141,7 +152,9 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
         }
 
         // Remove edges involving subtree nodes
-        state.edges.retain(|e| !subtree.contains(&e.parent) && !subtree.contains(&e.child));
+        state
+            .edges
+            .retain(|e| !subtree.contains(&e.parent) && !subtree.contains(&e.child));
 
         // Also remove the disconnected node from proxies/publishers to prevent re-selection
         let proxies_before = state.proxies.len();
@@ -156,7 +169,7 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
         let edges_removed = edges_before - edges_after;
 
         let new_value = serde_json::to_string(&state).unwrap_or_else(|_| "{}".to_string());
-        
+
         match atomic_update(redis_url, &key, &new_value, &old) {
             Ok(true) => {
                 // Only clean up gdpname_map if this node was actually a proxy/publisher that died
@@ -166,7 +179,7 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
                         eprintln!("[Signaling] Failed to clean gdpname_map: {}", e);
                     }
                 }
-                
+
                 println!(
                     "[Signaling] Disconnected {} from topic {} (attempt {}, edges_removed={}, proxies_removed={}, publishers_removed={}, subtree: {:?})",
                     node, topic_gdp, attempt + 1, edges_removed, proxies_removed, publishers_removed, subtree
@@ -180,8 +193,11 @@ fn disconnect_node(redis_url: &str, topic_gdp: &str, node: &str) {
             }
         }
     }
-    
-    eprintln!("[Signaling] Disconnect retries exceeded for {} on topic {}", node, topic_gdp);
+
+    eprintln!(
+        "[Signaling] Disconnect retries exceeded for {} on topic {}",
+        node, topic_gdp
+    );
 }
 
 // --- WebSocket Connection Handling ---
@@ -203,19 +219,28 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
             return;
         }
     };
-    
+
     println!("[Signaling] Client connected: {}", client_id);
 
     let (tx, rx) = mpsc::unbounded();
-    
+
     // Register with generation counter (handles reconnects cleanly)
     let my_generation = {
         let mut locked = clients.lock().unwrap();
-        let gen = locked.get(&client_id).map(|c| c.generation + 1).unwrap_or(1);
-        locked.insert(client_id.clone(), Client { generation: gen, tx: tx.clone() });
+        let gen = locked
+            .get(&client_id)
+            .map(|c| c.generation + 1)
+            .unwrap_or(1);
+        locked.insert(
+            client_id.clone(),
+            Client {
+                generation: gen,
+                tx: tx.clone(),
+            },
+        );
         gen
     };
-    
+
     // Deliver any pending messages that were buffered before this client connected
     {
         let mut pending = pending_messages.lock().unwrap();
@@ -239,7 +264,7 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
                     let target_id = content["id"].to_string();
                     content.insert("id", client_id_for_process.clone()).ok();
                     let msg_to_send = Message::text(json::stringify(content));
-                    
+
                     let clients_locked = clients.lock().unwrap();
                     if let Some(target) = clients_locked.get(&target_id) {
                         let _ = target.tx.unbounded_send(msg_to_send);
@@ -260,10 +285,14 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
 
     // Cleanup on disconnect
     println!("[Signaling] Client disconnected: {}", client_id);
-    
+
     {
         let mut locked = clients.lock().unwrap();
-        if locked.get(&client_id).map(|c| c.generation == my_generation).unwrap_or(false) {
+        if locked
+            .get(&client_id)
+            .map(|c| c.generation == my_generation)
+            .unwrap_or(false)
+        {
             locked.remove(&client_id);
         }
     }
@@ -274,7 +303,7 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
     if parts.len() != 3 {
         return;
     }
-    
+
     let topic_gdp = parts[0].to_string();
     let self_node = parts[1].to_string();
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://rib:6379".to_string());
@@ -283,7 +312,7 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
     tokio::spawn(async move {
         // Debounce: allow time for reconnects before cleanup
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        
+
         // Only clean up if no other connections exist for this node
         let still_connected = {
             let locked = clients_for_check.lock().unwrap();
@@ -292,7 +321,7 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
                 p.len() == 3 && p[0] == topic_gdp && p[1] == self_node
             })
         };
-        
+
         if !still_connected {
             disconnect_node(&redis_url, &topic_gdp, &self_node);
         }
@@ -302,7 +331,11 @@ async fn handle_client(clients: ClientMap, pending_messages: PendingMessages, st
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
     let port = env::args().nth(1).unwrap_or_else(|| "8000".to_string());
-    let endpoint = if port.contains(':') { port } else { format!("0.0.0.0:{}", port) };
+    let endpoint = if port.contains(':') {
+        port
+    } else {
+        format!("0.0.0.0:{}", port)
+    };
 
     println!("[Signaling] Starting on {}", endpoint);
 
@@ -312,7 +345,11 @@ async fn main() -> Result<(), std::io::Error> {
 
     while let Ok((stream, addr)) = listener.accept().await {
         println!("[Signaling] Connection from {}", addr);
-        tokio::spawn(handle_client(clients.clone(), pending_messages.clone(), stream));
+        tokio::spawn(handle_client(
+            clients.clone(),
+            pending_messages.clone(),
+            stream,
+        ));
     }
 
     Ok(())

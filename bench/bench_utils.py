@@ -168,13 +168,10 @@ def choose_proxies(num_listeners, fanout):
 
 
 def container_hostname(docker_cli, cid):
-    try:
-        info = docker_cli.container.inspect(cid)
-        hn = getattr(getattr(info, "config", None), "hostname", None)
-        if hn:
-            return str(hn)
-    except Exception:
-        pass
+    # In Docker, `$HOSTNAME` inside the container defaults to the container ID
+    # (short) unless explicitly overridden. Our join/first-msg benchmark hooks
+    # use `HOSTNAME` as the Redis hash field, so `cid[:12]` is the fast path
+    # and avoids an expensive per-container inspect().
     return str(cid)[:12]
 
 
@@ -195,18 +192,29 @@ def join_latency_from_redis(hostnames, max_wait_secs):
     while time.time() < deadline and len(out_ms) < len(hostnames):
         try:
             r = rds()
+            # Fetch all fields at once; much cheaper than 2*N HGET calls.
+            # Both hashes are populated using HSETNX in the Rust code.
+            attempt = r.hgetall("bench_join_attempt_ms") or {}
+            first = r.hgetall("bench_first_msg_ms") or {}
             for hn in hostnames:
                 if hn in out_ms:
                     continue
-                a = r.hget("bench_join_attempt_ms", hn)
-                b = r.hget("bench_first_msg_ms", hn)
+                a = attempt.get(hn)
+                b = first.get(hn)
                 if a is None or b is None:
                     continue
-                out_ms[hn] = int(b) - int(a)
-            r.close()
+                try:
+                    out_ms[hn] = int(b) - int(a)
+                except Exception:
+                    continue
+            try:
+                r.close()
+            except Exception:
+                pass
         except Exception:
             pass
-        time.sleep(0.5)
+        # Poll frequently; bulk reads keep overhead low.
+        time.sleep(0.1)
     return out_ms
 
 

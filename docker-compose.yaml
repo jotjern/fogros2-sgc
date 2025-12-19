@@ -34,6 +34,7 @@ services:
     environment:
       SGC_CONFIG: "${SGC_CONFIG_TALKER:-talker-docker.toml}"
       FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+      SGC_ROUTING_TRACE: "${SGC_ROUTING_TRACE:-0}"
       BENCH_LATENCY: "${BENCH_LATENCY:-0}"
       BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
       BENCH_PAYLOAD_BYTES: "${BENCH_PAYLOAD_BYTES:-0}"
@@ -68,6 +69,7 @@ services:
     environment:
       SGC_CONFIG: "${SGC_CONFIG_LISTENER:-listener-docker.toml}"
       FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+      SGC_ROUTING_TRACE: "${SGC_ROUTING_TRACE:-0}"
       BENCH_LATENCY: "${BENCH_LATENCY:-0}"
       BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
       RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
@@ -100,6 +102,7 @@ services:
     environment:
       SGC_CONFIG: "${SGC_CONFIG_PROXY:-proxy-docker.toml}"
       FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+      SGC_ROUTING_TRACE: "${SGC_ROUTING_TRACE:-0}"
       RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
       CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
     init: true

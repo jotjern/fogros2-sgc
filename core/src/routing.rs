@@ -17,10 +17,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use std::sync::OnceLock;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_FANOUT: usize = 3;
-const MAX_RETRIES: usize = 32;
+// During large concurrent joins, optimistic CAS can conflict frequently. If we bail out too
+// early, the caller may end up retrying at a much coarser timescale (seconds), which inflates
+// join-latency tails. Use a higher retry budget with lightweight backoff.
+const MAX_RETRIES: usize = 128;
 static FANOUT: OnceLock<usize> = OnceLock::new();
 
 fn fanout() -> usize {
@@ -31,6 +35,67 @@ fn fanout() -> usize {
             .filter(|n| (1..=1024).contains(n))
             .unwrap_or(DEFAULT_FANOUT)
     })
+}
+
+fn routing_trace() -> bool {
+    std::env::var("SGC_ROUTING_TRACE")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn parent_is_usable(state: &RoutingState, redis_url: &str, topic_gdp: GDPName, node: &str) -> bool {
+    // Publisher root is always usable.
+    if state.has_publisher(node) {
+        return true;
+    }
+    // Only attach under proxies that have an active heartbeat. This prevents routing decisions
+    // from placing subscribers under proxies that are registered but not yet ready/alive, which
+    // can create large tail delays (no data flow until the proxy becomes healthy).
+    if state.has_proxy(node) {
+        return is_proxy_alive(redis_url, topic_gdp, node);
+    }
+    false
+}
+
+fn cas_backoff(attempt: usize) {
+    // Deterministic bounded backoff to reduce thundering-herd CAS conflicts.
+    let ms = (2u64.saturating_mul((attempt as u64) + 1)).min(50);
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+fn now_ms_i64() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn log_state_summary(prefix: &str, state: &RoutingState) {
+    if !routing_trace() {
+        return;
+    }
+    let children = build_children_map(&state.edges);
+    let f = fanout();
+    let mut max_children = 0usize;
+    let mut overfull: Vec<(String, usize)> = Vec::new();
+    for (p, ch) in &children {
+        max_children = max_children.max(ch.len());
+        if ch.len() > f {
+            overfull.push((p.clone(), ch.len()));
+        }
+    }
+    overfull.sort_by(|a, b| b.1.cmp(&a.1));
+    info!(
+        "[routing][trace] {} publishers={} proxies={} edges={} parents={} max_children={} overfull_parents={:?}",
+        prefix,
+        state.publishers.len(),
+        state.proxies.len(),
+        state.edges.len(),
+        children.len(),
+        max_children,
+        overfull
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,6 +112,10 @@ struct RoutingState {
     proxies: Vec<String>,
     /// Unique edges.
     edges: Vec<Edge>,
+    /// Best-effort timestamp (ms since epoch) when a node was (re)attached in the tree.
+    /// Used to pick older children when doing disruptive graft operations.
+    #[serde(default)]
+    attach_ms: HashMap<String, i64>,
 }
 
 impl RoutingState {
@@ -79,7 +148,9 @@ impl RoutingState {
     }
 
     fn has_edge(&self, parent: &str, child: &str) -> bool {
-        self.edges.iter().any(|e| e.parent == parent && e.child == child)
+        self.edges
+            .iter()
+            .any(|e| e.parent == parent && e.child == child)
     }
 
     fn add_edge_unique(&mut self, parent: String, child: String) {
@@ -89,7 +160,8 @@ impl RoutingState {
     }
 
     fn remove_edge(&mut self, parent: &str, child: &str) {
-        self.edges.retain(|e| !(e.parent == parent && e.child == child));
+        self.edges
+            .retain(|e| !(e.parent == parent && e.child == child));
     }
 
     fn has_parent(&self, node: &str) -> bool {
@@ -115,7 +187,9 @@ fn to_json(state: &RoutingState) -> String {
 fn build_children_map(edges: &[Edge]) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     for e in edges {
-        out.entry(e.parent.clone()).or_default().push(e.child.clone());
+        out.entry(e.parent.clone())
+            .or_default()
+            .push(e.child.clone());
     }
     // Deterministic order.
     for v in out.values_mut() {
@@ -125,7 +199,25 @@ fn build_children_map(edges: &[Edge]) -> HashMap<String, Vec<String>> {
     out
 }
 
-fn bfs_intermediates(state: &RoutingState, root: &str, children: &HashMap<String, Vec<String>>) -> Vec<String> {
+fn build_children_map_insertion_order(edges: &[Edge]) -> HashMap<String, Vec<String>> {
+    // Preserve insertion order per parent (deduped). Useful for selecting "recent" children
+    // during grafting to avoid repeatedly disrupting early-joining listeners.
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut seen: HashMap<String, HashSet<String>> = HashMap::new();
+    for e in edges {
+        let set = seen.entry(e.parent.clone()).or_default();
+        if set.insert(e.child.clone()) {
+            out.entry(e.parent.clone())
+                .or_default()
+                .push(e.child.clone());
+        }
+    }
+    out
+}
+
+fn bfs_intermediates(
+    state: &RoutingState, root: &str, children: &HashMap<String, Vec<String>>,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut q = VecDeque::new();
     let mut seen = HashSet::<String>::new();
@@ -148,6 +240,29 @@ fn bfs_intermediates(state: &RoutingState, root: &str, children: &HashMap<String
     out
 }
 
+fn bfs_intermediates_with_depth(
+    state: &RoutingState, root: &str, children: &HashMap<String, Vec<String>>,
+) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    let mut q: VecDeque<(String, usize)> = VecDeque::new();
+    let mut seen = HashSet::<String>::new();
+
+    q.push_back((root.to_string(), 0));
+    seen.insert(root.to_string());
+
+    while let Some((n, d)) = q.pop_front() {
+        out.push((n.clone(), d));
+        let Some(ch) = children.get(&n) else { continue };
+        for c in ch {
+            if state.is_intermediate(c) && seen.insert(c.clone()) {
+                q.push_back((c.clone(), d + 1));
+            }
+        }
+    }
+
+    out
+}
+
 fn used_nodes_set(state: &RoutingState) -> HashSet<String> {
     let mut used = HashSet::<String>::new();
     for e in &state.edges {
@@ -163,16 +278,22 @@ fn used_nodes_set(state: &RoutingState) -> HashSet<String> {
 fn pick_unused_proxy(state: &RoutingState, redis_url: &str, topic_gdp: GDPName) -> Option<String> {
     let used = used_nodes_set(state);
     // Only pick proxies that are unused AND alive (have recent heartbeat)
-    state.proxies.iter()
+    state
+        .proxies
+        .iter()
         .find(|p| !used.contains(*p) && is_proxy_alive(redis_url, topic_gdp, p))
         .cloned()
 }
 
 /// Register this node as a publisher for the topic.
-pub fn register_publisher(redis_url: &str, topic_gdp: GDPName, publisher: GDPName, topic_name: &str) -> Result<(), String> {
+pub fn register_publisher(
+    redis_url: &str, topic_gdp: GDPName, publisher: GDPName, topic_name: &str,
+) -> Result<(), String> {
     let key = routing_key(topic_gdp);
     for attempt in 0..MAX_RETRIES {
-        let old = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();
+        let old = get_string(redis_url, &key)
+            .unwrap_or(None)
+            .unwrap_or_default();
         let mut st = parse_state(&old);
         let before = st.publishers.len();
         st.add_publisher(publisher.to_string());
@@ -180,7 +301,10 @@ pub fn register_publisher(redis_url: &str, topic_gdp: GDPName, publisher: GDPNam
 
         let new = to_json(&st);
         if atomic_update(redis_url, &key, &new, &old, 1).map_err(|e| e.to_string())? {
-            info!("Registered publisher {} for topic {}", publisher, topic_name);
+            info!(
+                "Registered publisher {} for topic {}",
+                publisher, topic_name
+            );
             debug!(
                 "[routing] register_publisher attempt={} topic={} key={} publisher={} publishers_len {}->{} proxies_len={} edges_len={}",
                 attempt,
@@ -202,10 +326,14 @@ pub fn register_publisher(redis_url: &str, topic_gdp: GDPName, publisher: GDPNam
 }
 
 /// Register this node as a proxy candidate for the topic.
-pub fn register_proxy(redis_url: &str, topic_gdp: GDPName, proxy: GDPName, topic_name: &str) -> Result<(), String> {
+pub fn register_proxy(
+    redis_url: &str, topic_gdp: GDPName, proxy: GDPName, topic_name: &str,
+) -> Result<(), String> {
     let key = routing_key(topic_gdp);
     for attempt in 0..MAX_RETRIES {
-        let old = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();
+        let old = get_string(redis_url, &key)
+            .unwrap_or(None)
+            .unwrap_or_default();
         let mut st = parse_state(&old);
         let before = st.proxies.len();
         st.add_proxy(proxy.to_string());
@@ -237,7 +365,9 @@ pub fn register_proxy(redis_url: &str, topic_gdp: GDPName, proxy: GDPName, topic
 /// Subscribe (join) this node as a listener to the topic.
 ///
 /// This performs one CAS update of `{topic}-routing` (retried on conflicts).
-pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscriber: GDPName) -> Result<(), String> {
+pub fn subscribe(
+    redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscriber: GDPName,
+) -> Result<(), String> {
     let key = routing_key(topic_gdp);
     let subscriber_s = subscriber.to_string();
 
@@ -262,8 +392,12 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
     })();
 
     for attempt in 0..MAX_RETRIES {
-        let old = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();
+        let old = get_string(redis_url, &key)
+            .unwrap_or(None)
+            .unwrap_or_default();
         let mut st = parse_state(&old);
+
+        log_state_summary("subscribe:loaded", &st);
 
         debug!(
             "[routing] subscribe attempt={} topic={} key={} subscriber={} publishers_len={} proxies_len={} edges_len={}",
@@ -277,7 +411,10 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
         );
 
         if st.publishers.is_empty() {
-            return Err(format!("No publishers registered yet for topic {}", topic_name));
+            return Err(format!(
+                "No publishers registered yet for topic {}",
+                topic_name
+            ));
         }
         let root = st.publishers[0].clone();
         debug!(
@@ -294,8 +431,24 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
             return Ok(());
         }
 
+        // Track (re)attachment time for churn-aware graft decisions.
+        st.attach_ms
+            .entry(subscriber_s.clone())
+            .or_insert_with(now_ms_i64);
+        // Seed attach timestamps for existing listener edges (best-effort). Without this,
+        // older listeners can appear as "infinitely old" and be moved repeatedly during grafts,
+        // inflating join-latency tails.
+        let seed_ts = now_ms_i64();
+        for e in &st.edges {
+            if !st.is_intermediate(&e.child) {
+                st.attach_ms.entry(e.child.clone()).or_insert(seed_ts);
+            }
+        }
+
         let children = build_children_map(&st.edges);
-        let nodes = bfs_intermediates(&st, &root, &children);
+        let children_ins = build_children_map_insertion_order(&st.edges);
+        let nodes_with_depth = bfs_intermediates_with_depth(&st, &root, &children);
+        let nodes: Vec<String> = nodes_with_depth.iter().map(|(n, _)| n.clone()).collect();
         debug!(
             "[routing] subscribe topic={} subscriber={} bfs_nodes={:?}",
             topic_gdp, subscriber, nodes
@@ -303,6 +456,15 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
 
         // Pass 1: attach to first BFS node with spare fanout.
         for n in &nodes {
+            if st.has_proxy(n) && !parent_is_usable(&st, redis_url, topic_gdp, n) {
+                if routing_trace() {
+                    info!(
+                        "[routing][trace] subscribe skip_unusable_parent topic={} subscriber={} parent={} reason=proxy_not_alive",
+                        topic_gdp, subscriber, n
+                    );
+                }
+                continue;
+            }
             let cnt = children.get(n).map(|v| v.len()).unwrap_or(0);
             let f = fanout();
             debug!(
@@ -315,24 +477,42 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
                     topic_gdp, subscriber, n, cnt, f
                 );
                 st.add_edge_unique(n.clone(), subscriber_s.clone());
+                log_state_summary("subscribe:after_attach_mutation", &st);
 
                 let new = to_json(&st);
                 if atomic_update(redis_url, &key, &new, &old, 1).map_err(|e| e.to_string())? {
-                    info!("Subscribed {} to topic {} under {}", subscriber, topic_name, n);
+                    info!(
+                        "Subscribed {} to topic {} under {}",
+                        subscriber, topic_name, n
+                    );
                     return Ok(());
                 }
                 debug!(
                     "[routing] subscribe topic={} subscriber={} action=attach parent={} result=cas_conflict retrying",
                     topic_gdp, subscriber, n
                 );
+                cas_backoff(attempt);
                 continue;
             }
         }
 
         // Pass 2: no capacity anywhere => grow with a proxy graft.
         // We must keep fanout consistent for both the parent and the new proxy.
-        for n in &nodes {
-            let ch = children.get(n).cloned().unwrap_or_default();
+        // Prefer grafting deeper in the tree to minimize disruptive re-ordering of
+        // high-level subtrees during mass joins.
+        let mut candidates = nodes_with_depth.clone();
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (n, depth) in candidates {
+            if st.has_proxy(&n) && !parent_is_usable(&st, redis_url, topic_gdp, &n) {
+                if routing_trace() {
+                    info!(
+                        "[routing][trace] subscribe pass=2 skip_unusable_parent topic={} subscriber={} parent={} depth={} reason=proxy_not_alive",
+                        topic_gdp, subscriber, n, depth
+                    );
+                }
+                continue;
+            }
+            let ch = children_ins.get(&n).cloned().unwrap_or_default();
             if ch.is_empty() {
                 debug!(
                     "[routing] subscribe topic={} subscriber={} pass=2 node={} skip=empty_children",
@@ -349,46 +529,72 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
             }
 
             let Some(new_proxy) = pick_unused_proxy(&st, redis_url, topic_gdp) else {
-                return Err(format!("No unused proxies available to grow routing tree for topic {}", topic_name));
+                return Err(format!(
+                    "No unused proxies available to grow routing tree for topic {}",
+                    topic_name
+                ));
             };
 
             // Parent `n` is full (otherwise pass-1 would have attached). After adding `new_proxy`,
             // we must move >= 1 child off `n`.
             // `new_proxy` must have <= fanout() children, and it must include `subscriber`,
             // so we may move at most fanout()-1 existing children.
-            let mut non_proxy_children: Vec<String> = ch.iter().filter(|c| !st.is_proxy(c)).cloned().collect();
-            // deterministic: `ch` is sorted already
+            let mut non_proxy_children: Vec<String> =
+                ch.iter().filter(|c| !st.is_proxy(c)).cloned().collect();
             let f = fanout();
             let move_count = non_proxy_children.len().min(f.saturating_sub(1)).max(1);
+            // Prefer moving *older* children (those that have likely already received data)
+            // to avoid inflating join latency for newly joining nodes.
+            non_proxy_children.sort_by(|a, b| {
+                let ta = st.attach_ms.get(a).copied().unwrap_or(0);
+                let tb = st.attach_ms.get(b).copied().unwrap_or(0);
+                ta.cmp(&tb).then_with(|| a.cmp(b))
+            });
             non_proxy_children.truncate(move_count);
 
             info!(
-                "[routing] subscribe decision topic={} subscriber={} action=graft_proxy parent={} new_proxy={} reason=no_capacity move_children_count={} children={:?}",
-                topic_gdp, subscriber, n, new_proxy, move_count, ch
+                "[routing] subscribe decision topic={} subscriber={} action=graft_proxy parent={} depth={} new_proxy={} reason=no_capacity move_children_count={} children={:?}",
+                topic_gdp, subscriber, n, depth, new_proxy, move_count, ch
             );
+            if routing_trace() {
+                info!(
+                    "[routing][trace] graft plan topic={} subscriber={} parent={} depth={} new_proxy={} move_children={:?}",
+                    topic_gdp, subscriber, n, depth, new_proxy, non_proxy_children
+                );
+            }
 
             // Add proxy under parent.
             st.add_edge_unique(n.clone(), new_proxy.clone());
             // Attach subscriber under proxy.
             st.add_edge_unique(new_proxy.clone(), subscriber_s.clone());
             // Move bounded set of non-proxy children under proxy.
+            let ts = now_ms_i64();
             for c in non_proxy_children {
-                st.remove_edge(n, &c);
+                let c2 = c.clone();
+                st.remove_edge(&n, &c);
                 st.add_edge_unique(new_proxy.clone(), c);
+                // Mark moved child as "recent" so we don't keep moving the same nodes.
+                st.attach_ms.insert(c2, ts);
             }
+            log_state_summary("subscribe:after_graft_mutation", &st);
 
             let new = to_json(&st);
             if atomic_update(redis_url, &key, &new, &old, 1).map_err(|e| e.to_string())? {
-                info!("Subscribed {} to topic {} via new proxy {}", subscriber, topic_name, new_proxy);
+                info!(
+                    "Subscribed {} to topic {} via new proxy {}",
+                    subscriber, topic_name, new_proxy
+                );
                 return Ok(());
             }
             debug!(
                 "[routing] subscribe topic={} subscriber={} action=graft_proxy parent={} new_proxy={} result=cas_conflict retrying",
                 topic_gdp, subscriber, n, new_proxy
             );
+            cas_backoff(attempt);
         }
 
         warn!("Subscribe({}) could not find a place; retrying", subscriber);
+        cas_backoff(attempt);
     }
 
     Err(format!(
@@ -405,7 +611,9 @@ pub fn disconnect(redis_url: &str, topic_gdp: GDPName, node: GDPName) -> Result<
     let node_s = node.to_string();
 
     for attempt in 0..MAX_RETRIES {
-        let old = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();
+        let old = get_string(redis_url, &key)
+            .unwrap_or(None)
+            .unwrap_or_default();
         let mut st = parse_state(&old);
 
         debug!(
@@ -437,7 +645,8 @@ pub fn disconnect(redis_url: &str, topic_gdp: GDPName, node: GDPName) -> Result<
         }
 
         let before_edges = st.edges.len();
-        st.edges.retain(|e| !subtree.contains(&e.parent) && !subtree.contains(&e.child));
+        st.edges
+            .retain(|e| !subtree.contains(&e.parent) && !subtree.contains(&e.child));
         let after_edges = st.edges.len();
 
         let new = to_json(&st);
@@ -467,7 +676,9 @@ pub fn disconnect(redis_url: &str, topic_gdp: GDPName, node: GDPName) -> Result<
 /// Read the current routing edges as `Connection`s.
 pub fn current_connections(redis_url: &str, topic_gdp: GDPName) -> Result<Vec<Connection>, String> {
     let key = routing_key(topic_gdp);
-    let raw = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();
+    let raw = get_string(redis_url, &key)
+        .unwrap_or(None)
+        .unwrap_or_default();
     let st = parse_state(&raw);
 
     let mut out = Vec::new();

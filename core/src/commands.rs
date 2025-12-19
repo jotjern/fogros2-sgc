@@ -15,7 +15,10 @@ pub fn init(name: &str) -> Result<()> {
 
     // Check if already exists
     if Path::new(&secret_path).exists() {
-        eprintln!("Error: Group secret '{}' already exists at {}", name, secret_path);
+        eprintln!(
+            "Error: Group secret '{}' already exists at {}",
+            name, secret_path
+        );
         eprintln!("To regenerate, first delete: rm -rf {}", secret_dir);
         std::process::exit(1);
     }
@@ -35,9 +38,8 @@ pub fn init(name: &str) -> Result<()> {
     let mut file = fs::File::create(&secret_path).map_err(|e| {
         utils::error::Error::new(&format!("Failed to create {}: {}", secret_path, e))
     })?;
-    file.write_all(&secret).map_err(|e| {
-        utils::error::Error::new(&format!("Failed to write secret: {}", e))
-    })?;
+    file.write_all(&secret)
+        .map_err(|e| utils::error::Error::new(&format!("Failed to write secret: {}", e)))?;
 
     println!("✓ Created group secret: {}", secret_path);
     println!();
@@ -105,7 +107,10 @@ pub fn check() -> Result<()> {
         Ok(()) => println!("✓ Signaling server reachable: {}", config.signaling_server),
         Err(e) => {
             println!("✗");
-            errors.push(format!("Cannot connect to signaling server {}: {}", config.signaling_server, e));
+            errors.push(format!(
+                "Cannot connect to signaling server {}: {}",
+                config.signaling_server, e
+            ));
         }
     }
 
@@ -117,7 +122,10 @@ pub fn check() -> Result<()> {
         Ok(()) => println!("✓ Routing server reachable: {}", config.routing_server),
         Err(e) => {
             println!("✗");
-            errors.push(format!("Cannot connect to routing server {}: {}", config.routing_server, e));
+            errors.push(format!(
+                "Cannot connect to routing server {}: {}",
+                config.routing_server, e
+            ));
         }
     }
 
@@ -170,8 +178,7 @@ fn test_signaling_server(url: &str) -> std::result::Result<(), String> {
         .next()
         .ok_or_else(|| "No addresses found".to_string())?;
 
-    TcpStream::connect_timeout(&addr, Duration::from_secs(5))
-        .map_err(|e| e.to_string())?;
+    TcpStream::connect_timeout(&addr, Duration::from_secs(5)).map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -228,7 +235,10 @@ pub fn config() -> Result<()> {
     println!("  routing_server: {}", config.routing_server);
     println!("  topics:");
     for topic in &config.topics {
-        println!("    - {} ({}) [{}]", topic.name, topic.topic_type, topic.role);
+        println!(
+            "    - {} ({}) [{}]",
+            topic.name, topic.topic_type, topic.role
+        );
     }
     Ok(())
 }

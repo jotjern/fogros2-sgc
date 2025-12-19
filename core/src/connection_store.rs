@@ -4,10 +4,12 @@ use std::str::FromStr;
 
 /// Parse connection string, returning None on error.
 pub fn parse_connection(connection_string: &str) -> Option<Connection> {
-    Connection::from_str(connection_string).map_err(|e| {
-        error!("Failed to parse connection {}: {:?}", connection_string, e);
-        e
-    }).ok()
+    Connection::from_str(connection_string)
+        .map_err(|e| {
+            error!("Failed to parse connection {}: {:?}", connection_string, e);
+            e
+        })
+        .ok()
 }
 
 /// Generate connection identifier for tracking connections.

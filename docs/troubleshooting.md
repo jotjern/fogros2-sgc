@@ -123,7 +123,7 @@ RUST_LOG=debug sgc router
 
 ```bash
 # Connect to Redis
-redis-cli -h localhost -p 8003
+redis-cli -h localhost -p 8002
 
 # List all keys
 KEYS *
@@ -143,7 +143,7 @@ docker compose logs signal
 
 ```bash
 docker compose up dashboard
-# Open http://localhost:3001
+# Open http://localhost:3000
 ```
 
 Shows:

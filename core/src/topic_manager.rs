@@ -68,8 +68,8 @@ async fn establish_connection(
     let shutdown_tx_for_webrtc = shutdown_tx.clone();
 
     tokio::spawn(async move {
-        let (webrtc_stream, webrtc_shutdown) = match register_webrtc_stream(&my_signal_id, signal_id_to_dial).await {
-            Ok((stream, shutdown)) => (stream, shutdown),
+        let (webrtc_stream, webrtc_shutdown, webrtc_guard) = match register_webrtc_stream(&my_signal_id, signal_id_to_dial).await {
+            Ok((stream, shutdown, guard)) => (stream, shutdown, guard),
             Err(e) => {
                 error!("[Connection] WebRTC setup failed for {}: {}", my_signal_id, e);
                 return;
@@ -88,7 +88,7 @@ async fn establish_connection(
             let _ = webrtc_shutdown_clone.send(());
         });
 
-        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx));
+        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx, webrtc_guard));
         
         if is_publisher {
             tokio::spawn(ros_to_network_forwarder(
@@ -135,6 +135,10 @@ async fn handle_connection_added(
     }
 
     let conn_id = connection_id(topic_gdp, &connection);
+    if connections.contains_key(&conn_id) {
+        info!("Skipping duplicate connection add: {}", conn_id);
+        return connection.publisher == my_gdp_name;
+    }
     let shutdown_tx = establish_connection(
         connection.clone(), topic_name, topic_type, secret, my_gdp_name, topic_gdp,
     ).await;

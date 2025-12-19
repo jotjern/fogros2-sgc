@@ -10,6 +10,7 @@ use redis_async::client;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 use utils::app_config::AppConfig;
 use crate::structs::GDPName;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Get Redis URL from config (e.g., "redis://host:6379").
 pub fn get_redis_url() -> String {
@@ -217,4 +218,33 @@ pub fn test_redis_connection(redis_url: &str) -> RedisResult<()> {
     let mut con = client.get_connection()?;
     redis::cmd("PING").query::<String>(&mut con)?;
     Ok(())
+}
+
+/// Mark a node as having received data (for dashboard visualization).
+/// This is stored in a Redis set for persistence across dashboard sessions.
+pub fn mark_node_received_data(gdp_name: GDPName) {
+    let redis_url = get_redis_url();
+    let result: RedisResult<()> = (|| {
+        let client = Client::open(redis_url)?;
+        let mut con = client.get_connection()?;
+        let key = "nodes_received_data";
+        let _: () = con.sadd(key, gdp_name.to_string())?;
+
+        // Benchmark hook: mark time of first received payload (per-container).
+        // Stored once (HSETNX) so subsequent receives don't overwrite.
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let field = get_container_name();
+        let _: i32 = redis::cmd("HSETNX")
+            .arg("bench_first_msg_ms")
+            .arg(field)
+            .arg(ts_ms)
+            .query(&mut con)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        error!("Failed to mark node {} as received data: {}", gdp_name, e);
+    }
 }

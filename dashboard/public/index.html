@@ -111,8 +111,6 @@
       overflow: hidden;
     }
     .node-circle {
-      stroke: #fff;
-      stroke-width: 3;
       transition: stroke 0.2s ease, stroke-width 0.2s ease;
     }
     .flash-send {
@@ -120,11 +118,7 @@
       stroke-width: 7 !important;
       filter: drop-shadow(0 0 8px rgba(255, 107, 107, 0.7));
     }
-    .flash-recv {
-      stroke: #4ecdc4 !important;
-      stroke-width: 7 !important;
-      filter: drop-shadow(0 0 8px rgba(78, 205, 196, 0.7));
-    }
+    /* Removed green flash for receive - yellow outline is sufficient */
 
     #graph {
       width: 100%;
@@ -174,6 +168,11 @@
 
     .legend-color.subscriber {
       background: #a78bfa;
+    }
+
+    .legend-color.data-received {
+      background: #5c7cfa;
+      border: 3px solid #ffd700;
     }
 
     .stats-item {
@@ -310,6 +309,10 @@
           <div class="legend-color subscriber"></div>
           <span>Subscriber</span>
         </div>
+        <div class="legend-item">
+          <div class="legend-color data-received"></div>
+          <span>Received Data</span>
+        </div>
       </div>
 
       <div class="stats">
@@ -329,6 +332,10 @@
         <div class="stats-item">
           <span>Topics</span>
           <span class="stats-value" id="topicCount">0</span>
+        </div>
+        <div class="stats-item">
+          <span>Receiving Data</span>
+          <span class="stats-value" id="dataReceivedCount">0</span>
         </div>
       </div>
     </div>
@@ -351,7 +358,8 @@
       nodeCount: document.getElementById('nodeCount'),
       proxyCount: document.getElementById('proxyCount'),
       connectionCount: document.getElementById('connectionCount'),
-      topicCount: document.getElementById('topicCount')
+      topicCount: document.getElementById('topicCount'),
+      dataReceivedCount: document.getElementById('dataReceivedCount')
     };
 
     let simulation = null;
@@ -464,16 +472,74 @@
     });
 
     const pendingFlashes = [];
+    // Track nodes that have ever received data (working WebRTC connections)
+    const nodesWithData = new Set();
+    
     socket.on('debug-event', (evt) => {
       if (!evt || !evt.node) return;
-      console.log('debug-event', evt);
+      console.log('debug-event received:', evt);
       const nodeId = evt.node;
       const dir = (evt.direction || '').toLowerCase();
-      const cls = dir.includes('send') || dir.includes('publish') ? 'flash-send' : 'flash-recv';
-      if (!highlightNode(nodeId, cls)) {
-        pendingFlashes.push({ nodeId, cls, ts: Date.now() });
+      
+      // Track nodes that have received data (indicates working WebRTC connection)
+      // Match: network_receive, ros_receive, recv, receive
+      const isReceive = dir.includes('receive') || dir.includes('recv') || 
+                        dir === 'network_receive' || dir === 'ros_receive';
+      const isSend = dir.includes('send') || dir.includes('publish');
+      
+      if (isReceive) {
+        const hadData = nodesWithData.has(nodeId);
+        nodesWithData.add(nodeId);
+        console.log('Node received data:', nodeId, 'total nodes with data:', nodesWithData.size);
+        // Update the node styling and stats if this is the first time receiving data
+        if (!hadData) {
+          updateNodeDataIndicators();
+          updateDataReceivedCount();
+        }
+      }
+      
+      // Only flash for send events (red), receive uses persistent yellow outline instead
+      if (isSend) {
+        if (!highlightNode(nodeId, 'flash-send')) {
+          pendingFlashes.push({ nodeId, cls: 'flash-send', ts: Date.now() });
+        }
       }
     });
+    
+    // Count only nodes that are in the current graph AND have received data
+    function updateDataReceivedCount() {
+      if (!graphData || !graphData.nodes) {
+        elements.dataReceivedCount.textContent = '0';
+        return;
+      }
+      const graphNodeIds = new Set(graphData.nodes.map(n => n.id));
+      let count = 0;
+      for (const nodeId of nodesWithData) {
+        if (graphNodeIds.has(nodeId)) count++;
+      }
+      elements.dataReceivedCount.textContent = count;
+    }
+    
+    // Update yellow outline for nodes that have received data
+    function updateNodeDataIndicators() {
+      if (!node) return;
+      node
+        .style('stroke', d => {
+          if (nodesWithData.has(d.id)) return '#ffd700'; // Yellow for nodes with data
+          if (d.type === 'proxy' && d.isDistressed) return '#ff0000';
+          return '#fff';
+        })
+        .style('stroke-width', d => {
+          if (nodesWithData.has(d.id)) return '4px';
+          if (d.type === 'proxy' && d.isDistressed) return '3px';
+          return '2px';
+        })
+        .style('stroke-dasharray', d => {
+          if (nodesWithData.has(d.id)) return 'none'; // Solid outline for data
+          if (d.type === 'proxy' && d.isDistressed) return '5,3';
+          return 'none';
+        });
+    }
 
     socket.on('redis-error', (message) => {
       showError(message);
@@ -500,6 +566,7 @@
       updateStats(data);
       processData(data);
       updateGraph();
+      updateDataReceivedCount(); // Recount based on current graph nodes
     });
 
     let reconnectTimer = null;
@@ -545,6 +612,9 @@
       const gdpMappings = data.gdpMappings || {};
       const unconnectedSet = new Set(data.unconnectedNodes || []);
       const distressedSet = new Set(data.distressedNodes || []);
+      
+      // Add nodes that have received data from Redis (persisted across sessions)
+      (data.nodesReceivedData || []).forEach(nodeId => nodesWithData.add(nodeId));
 
       // If backend didn't provide publishers/subscribers, infer from edges.
       if (publisherSet.size === 0 || subscriberSet.size === 0) {
@@ -755,17 +825,22 @@
           return '#5c7cfa';
         })
         .attr('opacity', d => d.isUnconnected ? 0.6 : 1.0)
-        .attr('stroke', d => {
-          // Add a red border for distressed proxies
+        .style('stroke', d => {
+          // Yellow outline for nodes that have received data (working WebRTC)
+          if (nodesWithData.has(d.id)) return '#ffd700';
+          // Red border for distressed proxies
           if (d.type === 'proxy' && d.isDistressed) return '#ff0000';
-          return 'none';
+          // Default white border
+          return '#fff';
         })
-        .attr('stroke-width', d => {
-          if (d.type === 'proxy' && d.isDistressed) return 3;
-          return 0;
+        .style('stroke-width', d => {
+          if (nodesWithData.has(d.id)) return '4px';
+          if (d.type === 'proxy' && d.isDistressed) return '3px';
+          return '2px';
         })
-        .attr('stroke-dasharray', d => {
-          // Add dashed border for distressed proxies to make them more visible
+        .style('stroke-dasharray', d => {
+          // Solid outline for nodes with data, dashed for distressed
+          if (nodesWithData.has(d.id)) return 'none';
           if (d.type === 'proxy' && d.isDistressed) return '5,3';
           return 'none';
         });

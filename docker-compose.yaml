@@ -1,13 +1,11 @@
 name: fogros2-sgc
 
 services:
-  # Redis for routing state
   rib:
     image: redislabs/redismod
     ports:
-      - '8003:6379'
+      - '8002:6379'
 
-  # WebRTC signaling server
   signal:
     restart: always
     build:
@@ -15,19 +13,15 @@ services:
       dockerfile: ./Dockerfile
     init: true
     ports:
-      - '8005:8000'
-    environment:
-      REDIS_URL: "redis://rib:6379"
+      - '8000:8000'
     command: /signaling_server
 
-  # Redis GUI (optional, for debugging)
   redisinsight:
     restart: always
     image: redislabs/redisinsight:latest
     ports:
-      - '8004:5540'
+      - '8001:5540'
 
-  # Demo: ROS2 talker (publisher)
   talker:
     restart: always
     build:
@@ -35,21 +29,32 @@ services:
       dockerfile: ./Dockerfile
     volumes:
       - "./src:/src"
+      - "./scripts:/scripts"
       - "./secrets:/secrets"
     depends_on:
       - rib
       - signal
     environment:
-      SGC_CONFIG: "talker-docker.toml"
+      SGC_CONFIG: "${SGC_CONFIG_TALKER:-talker-docker.toml}"
+      FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+      BENCH_LATENCY: "${BENCH_LATENCY:-0}"
+      BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
       RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
       CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
     init: true
     command: >
       bash -c "source /opt/ros/humble/setup.bash;
+      if [ \"${BENCH_LATENCY:-0}\" = \"1\" ]; then
+        echo \"BENCH_LATENCY: starting talker helper\" ;
+        if [ ! -f /scripts/bench_latency_talker.py ]; then
+          echo \"BENCH_LATENCY_ERROR: missing /scripts/bench_latency_talker.py\" ;
+        else
+          (python3 /scripts/bench_latency_talker.py 2>&1 || echo \"BENCH_LATENCY_ERROR: talker helper exited nonzero\") &
+        fi;
+      fi;
       ros2 run demo_nodes_py talker &
       /sgc router"
 
-  # Demo: ROS2 listener (subscriber)
   listener:
     restart: always
     build:
@@ -57,22 +62,33 @@ services:
       dockerfile: ./Dockerfile
     volumes:
       - "./src:/src"
+      - "./scripts:/scripts"
       - "./secrets:/secrets"
     depends_on:
       - rib
       - signal
       - talker
     environment:
-      SGC_CONFIG: "listener-docker.toml"
+      SGC_CONFIG: "${SGC_CONFIG_LISTENER:-listener-docker.toml}"
+      FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
+      BENCH_LATENCY: "${BENCH_LATENCY:-0}"
+      BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
       RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
       CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
     init: true
     command: >
       bash -c "source /opt/ros/humble/setup.bash;
+      if [ \"${BENCH_LATENCY:-0}\" = \"1\" ]; then
+        echo \"BENCH_LATENCY: starting listener helper\" ;
+        if [ ! -f /scripts/bench_latency_listener.py ]; then
+          echo \"BENCH_LATENCY_ERROR: missing /scripts/bench_latency_listener.py\" ;
+        else
+          (python3 /scripts/bench_latency_listener.py 2>&1 || echo \"BENCH_LATENCY_ERROR: listener helper exited nonzero\") &
+        fi;
+      fi;
       ros2 run demo_nodes_py listener &
       /sgc router"
 
-  # Demo: Proxy (for scaling)
   proxy:
     restart: always
     build:
@@ -80,12 +96,14 @@ services:
       dockerfile: ./Dockerfile
     volumes:
       - "./src:/src"
+      - "./scripts:/scripts"
       - "./secrets:/secrets"
     depends_on:
       - rib
       - signal
     environment:
-      SGC_CONFIG: "proxy-docker.toml"
+      SGC_CONFIG: "${SGC_CONFIG_PROXY:-proxy-docker.toml}"
+      FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
       RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
       CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
     init: true
@@ -93,7 +111,6 @@ services:
       bash -c "source /opt/ros/humble/setup.bash;
       /sgc router"
 
-  # Dashboard for visualization
   dashboard:
     restart: always
     image: node:18-alpine
@@ -102,7 +119,7 @@ services:
       - ./dashboard:/app
     command: ["sh", "-c", "npm install && npm start"]
     ports:
-      - '3001:3000'
+      - '3000:3000'
     depends_on:
       - rib
     environment:

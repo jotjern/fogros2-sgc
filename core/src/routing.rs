@@ -7,17 +7,31 @@
 //! - `publishers` is unique and preserves insertion order (publisher[0] is the root).
 //! - `proxies` is unique.
 //! - `edges` contains unique (parent, child) pairs.
-//! - For all parents, `children.len() <= FANOUT`.
+//! - For all parents, `children.len() <= fanout()`.
 
-use crate::db::{atomic_update, get_string};
+use crate::db::{atomic_update, get_container_name, get_string};
 use crate::structs::{Connection, GDPName};
 use log::{debug, info, warn};
+use redis::Commands;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const FANOUT: usize = 3;
+const DEFAULT_FANOUT: usize = 3;
 const MAX_RETRIES: usize = 32;
+static FANOUT: OnceLock<usize> = OnceLock::new();
+
+fn fanout() -> usize {
+    *FANOUT.get_or_init(|| {
+        std::env::var("FANOUT_FACTOR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| (1..=1024).contains(n))
+            .unwrap_or(DEFAULT_FANOUT)
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct Edge {
@@ -224,6 +238,26 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
     let key = routing_key(topic_gdp);
     let subscriber_s = subscriber.to_string();
 
+    // Benchmark hook: mark when this node begins routing subscribe attempts.
+    // Uses container hostname as the stable per-node identifier.
+    // Stored once (HSETNX) so retries don't overwrite.
+    let _ = (|| -> Result<(), ()> {
+        let client = redis::Client::open(redis_url).map_err(|_| ())?;
+        let mut con = client.get_connection().map_err(|_| ())?;
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ())?
+            .as_millis() as i64;
+        let field = get_container_name();
+        let _: i32 = redis::cmd("HSETNX")
+            .arg("bench_join_attempt_ms")
+            .arg(field)
+            .arg(ts_ms)
+            .query(&mut con)
+            .map_err(|_| ())?;
+        Ok(())
+    })();
+
     for attempt in 0..MAX_RETRIES {
         let old = get_string(redis_url, &key).unwrap_or(None).unwrap_or_default();
         let mut st = parse_state(&old);
@@ -267,14 +301,15 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
         // Pass 1: attach to first BFS node with spare fanout.
         for n in &nodes {
             let cnt = children.get(n).map(|v| v.len()).unwrap_or(0);
+            let f = fanout();
             debug!(
                 "[routing] subscribe topic={} subscriber={} pass=1 node={} children={} fanout={}",
-                topic_gdp, subscriber, n, cnt, FANOUT
+                topic_gdp, subscriber, n, cnt, f
             );
-            if cnt < FANOUT {
+            if cnt < f {
                 info!(
                     "[routing] subscribe decision topic={} subscriber={} action=attach parent={} reason=capacity children={}/{}",
-                    topic_gdp, subscriber, n, cnt, FANOUT
+                    topic_gdp, subscriber, n, cnt, f
                 );
                 st.add_edge_unique(n.clone(), subscriber_s.clone());
 
@@ -316,11 +351,12 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
 
             // Parent `n` is full (otherwise pass-1 would have attached). After adding `new_proxy`,
             // we must move >= 1 child off `n`.
-            // `new_proxy` must have <= FANOUT children, and it must include `subscriber`,
-            // so we may move at most FANOUT-1 existing children.
+            // `new_proxy` must have <= fanout() children, and it must include `subscriber`,
+            // so we may move at most fanout()-1 existing children.
             let mut non_proxy_children: Vec<String> = ch.iter().filter(|c| !st.is_proxy(c)).cloned().collect();
             // deterministic: `ch` is sorted already
-            let move_count = non_proxy_children.len().min(FANOUT - 1).max(1);
+            let f = fanout();
+            let move_count = non_proxy_children.len().min(f.saturating_sub(1)).max(1);
             non_proxy_children.truncate(move_count);
 
             info!(

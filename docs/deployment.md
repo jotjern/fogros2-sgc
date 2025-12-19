@@ -24,7 +24,7 @@ signaling_server = "ws://signal.example.com:8000"
 **Option B: Self-hosted**
 ```bash
 docker compose up -d signal
-# Exposes port 8005
+# Exposes port 8000
 ```
 
 ### Redis (Routing Server)
@@ -73,8 +73,8 @@ Create a config file for each robot. Example for a camera robot:
 ```toml
 # robot1.toml - Camera robot
 group_secret = "my-fleet"
-signaling_server = "ws://YOUR_SERVER:8005"
-routing_server = "YOUR_SERVER:8003"
+signaling_server = "ws://YOUR_SERVER:8000"
+routing_server = "YOUR_SERVER:8002"
 
 [[topics]]
 name = "/camera/image"
@@ -92,8 +92,8 @@ And for a control station:
 ```toml
 # station.toml - Control station
 group_secret = "my-fleet"
-signaling_server = "ws://YOUR_SERVER:8005"
-routing_server = "YOUR_SERVER:8003"
+signaling_server = "ws://YOUR_SERVER:8000"
+routing_server = "YOUR_SERVER:8002"
 
 [[topics]]
 name = "/camera/image"
@@ -142,7 +142,7 @@ Use the dashboard to visualize connections:
 ```bash
 # On a machine that can reach Redis
 docker compose up dashboard
-# Open http://localhost:3001
+# Open http://localhost:3000
 ```
 
 ## Troubleshooting

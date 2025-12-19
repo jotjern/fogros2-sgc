@@ -248,3 +248,30 @@ pub fn mark_node_received_data(gdp_name: GDPName) {
         error!("Failed to mark node {} as received data: {}", gdp_name, e);
     }
 }
+
+/// Set a heartbeat key for this proxy with TTL.
+/// Other nodes can check if proxy is alive by checking if key exists.
+pub fn set_proxy_heartbeat(redis_url: &str, topic_gdp: GDPName, proxy: GDPName, ttl_secs: u64) -> Result<(), String> {
+    let key = format!("{}-proxy-alive-{}", topic_gdp, proxy);
+    let client = Client::open(redis_url).map_err(|e| e.to_string())?;
+    let mut con = client.get_connection().map_err(|e| e.to_string())?;
+    let _: () = redis::cmd("SETEX")
+        .arg(&key)
+        .arg(ttl_secs)
+        .arg("1")
+        .query(&mut con)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Check if a proxy is alive (heartbeat key exists).
+pub fn is_proxy_alive(redis_url: &str, topic_gdp: GDPName, proxy: &str) -> bool {
+    let key = format!("{}-proxy-alive-{}", topic_gdp, proxy);
+    let result: Option<bool> = (|| {
+        let client = Client::open(redis_url).ok()?;
+        let mut con = client.get_connection().ok()?;
+        let exists: i32 = redis::cmd("EXISTS").arg(&key).query(&mut con).ok()?;
+        Some(exists > 0)
+    })();
+    result.unwrap_or(false)
+}

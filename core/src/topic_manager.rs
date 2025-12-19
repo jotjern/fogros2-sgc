@@ -7,7 +7,7 @@
 //! - Handles reconnection when edges are removed from the routing tree
 
 use crate::connection_store::{connection_id, is_node_involved, parse_connection};
-use crate::db::{get_redis_url, watch_redis_key, RedisKeyChange};
+use crate::db::{get_redis_url, set_proxy_heartbeat, watch_redis_key, RedisKeyChange};
 use crate::network::ros::{network_to_ros_forwarder, ros_to_network_forwarder};
 use crate::network::webrtc::{register_webrtc_stream, webrtc_reader_and_writer};
 use crate::routing::{current_connections, register_proxy, register_publisher, subscribe};
@@ -68,11 +68,23 @@ async fn establish_connection(
     let shutdown_tx_for_webrtc = shutdown_tx.clone();
 
     tokio::spawn(async move {
-        let (webrtc_stream, webrtc_shutdown, webrtc_guard) = match register_webrtc_stream(&my_signal_id, signal_id_to_dial).await {
-            Ok((stream, shutdown, guard)) => (stream, shutdown, guard),
-            Err(e) => {
-                error!("[Connection] WebRTC setup failed for {}: {}", my_signal_id, e);
-                return;
+        // Retry WebRTC connection up to 3 times with exponential backoff
+        const MAX_RETRIES: u32 = 3;
+        let mut attempt = 0;
+        let (webrtc_stream, webrtc_shutdown, webrtc_guard) = loop {
+            attempt += 1;
+            match register_webrtc_stream(&my_signal_id, signal_id_to_dial.clone()).await {
+                Ok((stream, shutdown, guard)) => break (stream, shutdown, guard),
+                Err(e) => {
+                    if attempt >= MAX_RETRIES {
+                        error!("[Connection] WebRTC setup failed for {} after {} attempts: {}", my_signal_id, attempt, e);
+                        return;
+                    }
+                    let backoff_ms = 500 * (1 << attempt); // 1s, 2s, 4s
+                    warn!("[Connection] WebRTC attempt {}/{} failed for {}: {}, retrying in {}ms", 
+                          attempt, MAX_RETRIES, my_signal_id, e, backoff_ms);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                }
             }
         };
 
@@ -80,15 +92,18 @@ async fn establish_connection(
         let (rtc_tx, rtc_rx) = unbounded_channel();
         let node_name = format!("sgc_node_{}", rand::random::<u32>());
 
-        // Forward shutdown signal to WebRTC
-        let mut shutdown_rx = shutdown_tx_for_webrtc.subscribe();
+        // Forward shutdown signal to WebRTC signaling
+        let shutdown_rx_for_signaling = shutdown_tx_for_webrtc.subscribe();
         let webrtc_shutdown_clone = webrtc_shutdown.clone();
         tokio::spawn(async move {
-            let _ = shutdown_rx.recv().await;
+            let mut rx = shutdown_rx_for_signaling;
+            let _ = rx.recv().await;
             let _ = webrtc_shutdown_clone.send(());
         });
 
-        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx, webrtc_guard));
+        // Pass shutdown to data channel forwarder
+        let shutdown_rx_for_data = shutdown_tx_for_webrtc.subscribe();
+        tokio::spawn(webrtc_reader_and_writer(webrtc_stream, ros_tx, rtc_rx, webrtc_guard, shutdown_rx_for_data));
         
         if is_publisher {
             tokio::spawn(ros_to_network_forwarder(
@@ -326,6 +341,16 @@ fn setup_topic(
             if let Err(e) = register_proxy(&redis_url, topic_gdp, my_gdp_name, &topic_name) {
                 error!("Failed to register as proxy for {}: {}", topic_name, e);
             }
+            // Heartbeat task to indicate this proxy is alive
+            let redis_url_hb = redis_url.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = set_proxy_heartbeat(&redis_url_hb, topic_gdp, my_gdp_name, 10) {
+                        error!("Failed to set proxy heartbeat: {}", e);
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            });
         }
         _ => error!("Unknown role '{}' for topic {}", role, topic_name),
     }

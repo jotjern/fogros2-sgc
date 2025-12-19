@@ -9,7 +9,7 @@
 //! - `edges` contains unique (parent, child) pairs.
 //! - For all parents, `children.len() <= fanout()`.
 
-use crate::db::{atomic_update, get_container_name, get_string};
+use crate::db::{atomic_update, get_container_name, get_string, is_proxy_alive};
 use crate::structs::{Connection, GDPName};
 use log::{debug, info, warn};
 use redis::Commands;
@@ -160,9 +160,12 @@ fn used_nodes_set(state: &RoutingState) -> HashSet<String> {
     used
 }
 
-fn pick_unused_proxy(state: &RoutingState) -> Option<String> {
+fn pick_unused_proxy(state: &RoutingState, redis_url: &str, topic_gdp: GDPName) -> Option<String> {
     let used = used_nodes_set(state);
-    state.proxies.iter().find(|p| !used.contains(*p)).cloned()
+    // Only pick proxies that are unused AND alive (have recent heartbeat)
+    state.proxies.iter()
+        .find(|p| !used.contains(*p) && is_proxy_alive(redis_url, topic_gdp, p))
+        .cloned()
 }
 
 /// Register this node as a publisher for the topic.
@@ -345,7 +348,7 @@ pub fn subscribe(redis_url: &str, topic_gdp: GDPName, topic_name: &str, subscrib
                 continue;
             }
 
-            let Some(new_proxy) = pick_unused_proxy(&st) else {
+            let Some(new_proxy) = pick_unused_proxy(&st, redis_url, topic_gdp) else {
                 return Err(format!("No unused proxies available to grow routing tree for topic {}", topic_name));
             };
 

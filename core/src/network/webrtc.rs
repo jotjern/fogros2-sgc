@@ -276,6 +276,7 @@ pub async fn webrtc_reader_and_writer(
     ros_tx: UnboundedSender<GDPPacket>,
     mut rtc_rx: UnboundedReceiver<GDPPacket>,
     _guard: WebRtcGuard,
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let thread_name = generate_random_gdp_name();
     let mut parser = PacketParser::new();
@@ -286,6 +287,12 @@ pub async fn webrtc_reader_and_writer(
         let mut buf = vec![0u8; RECEIVE_BUFFER_SIZE];
 
         tokio::select! {
+            // Shutdown signal - close connection
+            _ = shutdown_rx.recv() => {
+                info!("[WebRTC] Shutdown received, closing data channel");
+                break;
+            }
+
             // WebRTC -> ROS
             read_result = stream.read(&mut buf) => {
                 let n = match read_result {

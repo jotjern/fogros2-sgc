@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Latency probe listener for benchmarking.
+
+Receives timestamped messages and computes end-to-end latency.
+Uses wall-clock time (time.time_ns) for cross-container synchronization.
+"""
 import os
 import time
 
@@ -10,31 +15,30 @@ from std_msgs.msg import String
 class LatencyListener(Node):
     def __init__(self):
         super().__init__("bench_latency_listener")
-        # Subscribe on /chatter (single-topic benchmark mode). We'll only process
-        # messages tagged by bench_latency_talker.
         topic = os.environ.get("BENCH_LATENCY_TOPIC", "/chatter")
         self.samples = []
-        self.max_samples = int(os.environ.get("BENCH_LATENCY_MAX_SAMPLES", "2000"))
+        self.max_samples = int(os.environ.get("BENCH_LATENCY_MAX_SAMPLES", "5000"))
         self.sub = self.create_subscription(String, topic, self._cb, 10)
         self.last_print = time.time()
-        self.print_every = float(os.environ.get("BENCH_LATENCY_PRINT_EVERY_SECS", "1.0"))
+        self.print_every = float(os.environ.get("BENCH_LATENCY_PRINT_EVERY_SECS", "5.0"))
 
     def _cb(self, msg: String):
+        # Use wall-clock time immediately on receive
+        recv_ns = time.time_ns()
+        
         data = msg.data or ""
         prefix = "BENCH_LATENCY_SENT_NS="
         if not data.startswith(prefix):
             return
 
-        now = self.get_clock().now()
         try:
-            sent_ns = int(data[len(prefix) :].strip())
+            sent_ns = int(data[len(prefix):].strip())
         except Exception:
             return
-        recv_ns = int(now.nanoseconds)
+        
         lat_ms = max(0.0, (recv_ns - sent_ns) / 1e6)
 
-        # Emit a parseable sample line.
-        # The benchmark script scrapes these from container logs.
+        # Emit parseable sample line (scraped by benchmark scripts)
         print(f"BENCH_LATENCY_MS={lat_ms:.3f}", flush=True)
 
         self.samples.append(lat_ms)
@@ -48,10 +52,12 @@ class LatencyListener(Node):
             if not s:
                 return
             s.sort()
+            p50 = s[len(s) // 2]
             p95 = s[int(0.95 * (len(s) - 1))]
+            p99 = s[int(0.99 * (len(s) - 1))]
             mean = sum(s) / len(s)
             print(
-                f"BENCH_LATENCY_SUMMARY count={len(s)} mean_ms={mean:.3f} p95_ms={p95:.3f} max_ms={s[-1]:.3f}",
+                f"BENCH_LATENCY_SUMMARY count={len(s)} mean={mean:.1f}ms p50={p50:.1f}ms p95={p95:.1f}ms p99={p99:.1f}ms max={s[-1]:.1f}ms",
                 flush=True,
             )
 
@@ -68,4 +74,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

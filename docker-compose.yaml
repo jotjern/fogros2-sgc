@@ -7,7 +7,6 @@ services:
       - '8002:6379'
 
   signal:
-    restart: always
     build:
       context: ./
       dockerfile: ./Dockerfile
@@ -17,13 +16,11 @@ services:
     command: /signaling_server
 
   redisinsight:
-    restart: always
     image: redislabs/redisinsight:latest
     ports:
       - '8001:5540'
 
   talker:
-    restart: always
     build:
       context: ./
       dockerfile: ./Dockerfile
@@ -39,6 +36,7 @@ services:
       FANOUT_FACTOR: "${FANOUT_FACTOR:-3}"
       BENCH_LATENCY: "${BENCH_LATENCY:-0}"
       BENCH_LATENCY_HZ: "${BENCH_LATENCY_HZ:-20}"
+      BENCH_PAYLOAD_BYTES: "${BENCH_PAYLOAD_BYTES:-0}"
       RMW_IMPLEMENTATION: "rmw_cyclonedds_cpp"
       CYCLONEDDS_URI: "file:///fog_ws/cyclonedds.ubuntu.2204.xml"
     init: true
@@ -56,7 +54,6 @@ services:
       /sgc router"
 
   listener:
-    restart: always
     build:
       context: ./
       dockerfile: ./Dockerfile
@@ -90,7 +87,6 @@ services:
       /sgc router"
 
   proxy:
-    restart: always
     build:
       context: ./
       dockerfile: ./Dockerfile
@@ -112,7 +108,6 @@ services:
       /sgc router"
 
   dashboard:
-    restart: always
     image: node:18-alpine
     working_dir: /app
     volumes:
